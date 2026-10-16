@@ -30,17 +30,25 @@
           f {
             inherit s;
             pkgs = nixpkgs.legacyPackages.${s};
+            # The musl triple of the build system; the package is built for
+            # it so the binary is fully static and runs on plain Ubuntu.
+            muslTarget =
+              if s == "x86_64-linux" then "x86_64-unknown-linux-musl" else "aarch64-unknown-linux-musl";
             # Pinned nightly toolchain: host compiler + lints + rust-src
             # (for -Z build-std of the BPF crate) + musl target std (for
-            # fully static test binaries that run on plain Ubuntu).
-            nightly = fenix.packages.${s}.combine [
-              fenix.packages.${s}.latest.rustc
-              fenix.packages.${s}.latest.cargo
-              fenix.packages.${s}.latest.clippy
-              fenix.packages.${s}.latest.rustfmt
-              fenix.packages.${s}.latest.rust-src
-              fenix.packages.${s}.targets.x86_64-unknown-linux-musl.latest.rust-std
-            ];
+            # the fully static binary that runs on plain Ubuntu).
+            nightly =
+              let
+                mt = if s == "x86_64-linux" then "x86_64-unknown-linux-musl" else "aarch64-unknown-linux-musl";
+              in
+              fenix.packages.${s}.combine [
+                fenix.packages.${s}.latest.rustc
+                fenix.packages.${s}.latest.cargo
+                fenix.packages.${s}.latest.clippy
+                fenix.packages.${s}.latest.rustfmt
+                fenix.packages.${s}.latest.rust-src
+                fenix.packages.${s}.targets.${mt}.latest.rust-std
+              ];
             # bpf-linker newer than nixpkgs': the 0.9.x in nixos-26.05
             # cannot read the LLVM bitcode of current nightly rustc
             # ("ERROR llvm: Invalid record"). Pinned upstream musl-static
@@ -120,11 +128,13 @@
           pkgs,
           nightly,
           bpfLinker,
+          muslTarget,
           ...
         }:
         rec {
-          # Single static binary with the BPF ELF embedded (compiled for
-          # bpfel-unknown-none by the a2scache crate's build script).
+          # Single static binary (musl) with the BPF ELF embedded
+          # (compiled for bpfel-unknown-none by the a2scache crate's build
+          # script). musl => runs on plain Ubuntu without a Nix glibc.
           a2scache =
             (pkgs.rustPlatform.buildRustPackage.override {
               stdenv = pkgs.stdenvNoCC;
@@ -150,12 +160,17 @@
 
                 buildPhase = ''
                   runHook preBuild
-                  cargo build --release --offline -p a2scache
+                  # Self-contained musl link (rust-lld + bundled crt); stdenv
+                  # has no cc and the musl target does not default to
+                  # self-contained on this toolchain. Target-scoped so host
+                  # crates (build.rs, proc-macros) keep the gnu defaults.
+                  export CARGO_TARGET_$(echo ${muslTarget} | tr 'a-z-' 'A-Z_')_RUSTFLAGS="-C link-self-contained=y -C linker=rust-lld -C linker-flavor=ld.lld"
+                  cargo build --release --offline -p a2scache --target ${muslTarget}
                   runHook postBuild
                 '';
                 installPhase = ''
                   mkdir -p $out/bin
-                  install -m 0755 target/release/a2scache $out/bin/a2scache
+                  install -m 0755 target/${muslTarget}/release/a2scache $out/bin/a2scache
                 '';
               };
 

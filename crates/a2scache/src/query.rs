@@ -3,8 +3,9 @@ use std::net::{SocketAddr, UdpSocket};
 use std::time::Duration;
 
 use a2s_protocol::{
+    NO_CHALLENGE, Reassembler, TYPE_CHALLENGE, TYPE_INFO_RESP, TYPE_PLAYER_RESP,
     build_info_request, build_info_request_challenged, build_player_request, is_fragment,
-    response_type, Reassembler, NO_CHALLENGE, TYPE_CHALLENGE, TYPE_INFO_RESP, TYPE_PLAYER_RESP,
+    response_type,
 };
 
 use crate::{Error, QueryKind, Result};
@@ -94,7 +95,14 @@ fn dance(
                 }
                 n
             }
-            Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+            // With set_read_timeout, std may surface an expired deadline as
+            // TimedOut or (on a spurious wakeup) as WouldBlock.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
                 return Err(Error::Bad("no response (timeout)".into()));
             }
             Err(e) => return Err(e.into()),

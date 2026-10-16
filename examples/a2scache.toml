@@ -26,12 +26,18 @@ global_refill_per_s = 50000
 # the same host need one entry per port. `mac` is optional: when set, the
 # first server's MAC becomes the source MAC of synthesized replies
 # (otherwise the MAC recorded by `attach` is kept).
+#
+# IMPORTANT: use the address you want CLIENTS to see (the IP the BPF
+# program answers for), and make sure the daemon can reach the server at
+# that address. The Source engine ignores A2S requests arriving with a
+# 127/8 source address, so 127.0.0.1 backends will never warm — use the
+# machine's real IP (or the server's public IP for a remote backend).
 
 [[server]]
-ip = "127.0.0.1"
+ip = "192.0.2.10"
 port = 27015
 # mac = "aa:bb:cc:dd:ee:ff"
 
 [[server]]
-ip = "127.0.0.1"
-port = 27016
+ip = "192.0.2.10"
+port = 27025

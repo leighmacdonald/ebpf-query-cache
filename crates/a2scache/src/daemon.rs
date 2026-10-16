@@ -21,9 +21,9 @@ use std::thread;
 use std::time::Duration;
 
 use a2s_protocol::{
-    build_info_request, build_info_request_challenged, build_player_request, cache_key,
-    is_fragment, response_type, CacheEntry, Config, Reassembler, MAX_PAYLOAD, NO_CHALLENGE,
-    TYPE_CHALLENGE, TYPE_INFO_RESP, TYPE_PLAYER_RESP,
+    CacheEntry, Config, MAX_PAYLOAD, NO_CHALLENGE, Reassembler, TYPE_CHALLENGE, TYPE_INFO_RESP,
+    TYPE_PLAYER_RESP, build_info_request, build_info_request_challenged, build_player_request,
+    cache_key, is_fragment, response_type,
 };
 use aya::maps::{Array, HashMap, Map, MapData};
 use serde::Deserialize;

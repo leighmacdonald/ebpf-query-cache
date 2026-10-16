@@ -19,7 +19,7 @@ build:
 
 # Enter the nix development shell
 develop:
-  nix develop -c "${SHELL:-bash}"
+  nix develop
 
 # Fast local build (inside `just develop` or an equivalent toolchain).
 # NOTE: just runs each recipe line in its own shell; keep state on one line.
@@ -42,10 +42,15 @@ test:
 test-e2e: build-local
   bash tests/e2e/run.sh
 
-# Install binary, systemd units and example config
+# End-to-end test against real TF2 servers (requires root + running srcds)
+test-e2e-real port1="27015" port2="27025":
+  bash tests/e2e/real_server.sh {{port1}} {{port2}}
+
+# Install binary, systemd units and example config.
+# Enable with: systemctl enable --now a2scache-attach@<iface> a2scache-daemon
 install: build
   sudo install -Dm 0755 result/bin/a2scache /usr/local/bin/a2scache
-  sudo install -Dm 0644 packaging/a2scache-attach.service /etc/systemd/system/a2scache-attach.service
+  sudo install -Dm 0644 packaging/a2scache-attach@.service /etc/systemd/system/a2scache-attach@.service
   sudo install -Dm 0644 packaging/a2scache-daemon.service /etc/systemd/system/a2scache-daemon.service
   sudo install -Dm 0644 examples/a2scache.toml /etc/a2scache.toml
   sudo systemctl daemon-reload

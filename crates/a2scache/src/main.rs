@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use a2scache::{bpf, daemon, query, QueryKind, Result};
+use a2scache::{QueryKind, Result, bpf, daemon, query};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]

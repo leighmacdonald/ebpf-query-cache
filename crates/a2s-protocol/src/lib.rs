@@ -44,7 +44,6 @@ pub enum Error {
     BufferTooSmall,
     BadMagic,
     BadFragment,
-    Compressed,
     TooLarge,
 }
 
@@ -178,15 +177,16 @@ impl Reassembler {
     }
 
     /// Feed one fragment datagram.
+    ///
+    /// The high bit of `id` marks a compressed A2S_PLAYER payload (used by
+    /// Source servers with large player lists); reassembly is identical, and
+    /// the cache serves the payload bytes verbatim, so it is accepted here.
     pub fn push(&mut self, dgram: &[u8]) -> Result<(), Error> {
         // FE FF FF FF + id:4 + total:1 + number:1 + size:2
         if dgram.len() < 12 || u32le(&dgram[0..4]) != SPLIT_MAGIC {
             return Err(Error::BadMagic);
         }
         let id = u32le(&dgram[4..8]);
-        if id & 0x8000_0000 != 0 {
-            return Err(Error::Compressed);
-        }
         let total = dgram[8];
         let number = dgram[9];
         if total == 0 || number >= total {
@@ -325,7 +325,12 @@ pub mod stats {
     pub const DROPPED_REWRITE: u32 = 10;
     pub const NON_A2S: u32 = 11;
     pub const UNKNOWN_KEY: u32 = 12;
-    pub const COUNT: usize = 13;
+    pub const DROPPED_REWRITE_GUARD: u32 = 13;
+    pub const DROPPED_REWRITE_TAIL: u32 = 14;
+    pub const DROPPED_REWRITE_HDR: u32 = 15;
+    pub const DROPPED_REWRITE_PAYLOAD: u32 = 16;
+    pub const DROPPED_REWRITE_REDIRECT: u32 = 17;
+    pub const COUNT: usize = 18;
 }
 
 const _: () = {
@@ -494,12 +499,14 @@ mod tests {
         );
         assert_eq!(r.push(&fragment(1, 2, 1, &[0; 10])), Ok(()));
 
-        // Compressed id.
+        // Compressed id (high bit set) is accepted; reassembly is identical.
+        let mut expected = vec![0xAA; 10];
+        expected.extend([0xBB; 10]);
         let mut r = Reassembler::new();
-        assert_eq!(
-            r.push(&fragment(0x8000_0001, 1, 0, &[0; 10])),
-            Err(Error::Compressed)
-        );
+        r.push(&fragment(0x8000_0001, 2, 0, &[0xAA; 10])).unwrap();
+        r.push(&fragment(0x8000_0001, 2, 1, &[0xBB; 10])).unwrap();
+        assert!(r.is_complete());
+        assert_eq!(r.reassembled().unwrap(), &expected[..]);
 
         // Oversize.
         let big = vec![0u8; MAX_PAYLOAD + 1];

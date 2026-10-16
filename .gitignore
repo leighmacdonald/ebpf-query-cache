@@ -10,4 +10,6 @@ result-*
 *.swp
 *~
 .DS_Store
-*.md
+__pycache__
+AGENTS.md
+TASKS.md

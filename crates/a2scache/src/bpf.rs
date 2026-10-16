@@ -2,11 +2,11 @@ use std::ffi::CString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use a2s_protocol::{cache_key_unpack, stats, CacheEntry, Config, MAX_PAYLOAD};
+use a2s_protocol::{CacheEntry, Config, MAX_PAYLOAD, cache_key_unpack, stats};
+use aya::EbpfLoader;
 use aya::maps::{Array, HashMap, Map, MapData, PerCpuArray};
 use aya::programs::tc;
 use aya::programs::{SchedClassifier, TcAttachType};
-use aya::EbpfLoader;
 
 use crate::{Error, Result};
 
@@ -52,6 +52,11 @@ pub const STATS_NAMES: [&str; stats::COUNT] = [
     "dropped_rewrite",
     "non_a2s",
     "unknown_key",
+    "dropped_rewrite_guard",
+    "dropped_rewrite_tail",
+    "dropped_rewrite_hdr",
+    "dropped_rewrite_payload",
+    "dropped_rewrite_redirect",
 ];
 
 pub fn pin_path(pin_dir: &Path, name: &str) -> PathBuf {
@@ -113,14 +118,20 @@ pub fn attach(elf: &[u8], iface: &str, pin_dir: &Path, ttl_sec: u64) -> Result<(
 
     match tc::qdisc_add_clsact(iface) {
         Ok(()) => eprintln!("added clsact qdisc on {iface}"),
-        Err(tc::TcError::AlreadyAttached) => eprintln!("clsact qdisc already present on {iface}"),
-        Err(e) => {
-            let msg = e.to_string();
-            if !msg.contains("exist") {
-                return Err(Error::Tc(e));
-            }
+        // aya surfaces an existing clsact qdisc as a netlink EEXIST, not as
+        // TcError::AlreadyAttached.
+        Err(tc::TcError::NetlinkError(ne)) if ne.raw_os_error() == Some(libc::EEXIST) => {
             eprintln!("clsact qdisc already present on {iface}");
         }
+        Err(e) => return Err(Error::Tc(e)),
+    }
+
+    // Drop any filter left by a previous attach so re-attach does not stack.
+    match tc::qdisc_detach_program(iface, TcAttachType::Ingress, PROG_NAME) {
+        Ok(()) => eprintln!("removed stale filter on {iface}"),
+        // The io error's Display is just the program name; match the kind.
+        Err(tc::TcError::IoError(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(Error::Tc(e)),
     }
 
     let mut bpf = EbpfLoader::new().load(elf)?;
@@ -130,8 +141,24 @@ pub fn attach(elf: &[u8], iface: &str, pin_dir: &Path, ttl_sec: u64) -> Result<(
         .ok_or_else(|| Error::Bad(format!("program {PROG_NAME} not in ELF")))?
         .try_into()?;
     prog.load()?;
-    prog.attach(iface, TcAttachType::Ingress)?;
+    // Attach via netlink (classic clsact filter), not TCX (aya's default on
+    // kernel >= 6.6): a TCX attachment is a bpf_link that our netlink-based
+    // detach/clean cannot find or remove, so it would leak and stack on every
+    // re-attach. A netlink filter keeps the program alive in-kernel after
+    // this process exits, with the pins keeping the maps reachable.
+    let link_id = prog.attach_with_options(
+        iface,
+        TcAttachType::Ingress,
+        tc::TcAttachOptions::Netlink(tc::NlOptions::default()),
+    )?;
     prog.pin(pin_path(pin_dir, PROG_NAME))?;
+    // Take the attachment out of aya's tracked links: aya detaches every
+    // tracked link when the program is dropped, which would remove the filter
+    // when this process exits. The netlink link holds no kernel resources
+    // (just ifindex/attach-type/priority/handle), so forgetting the wrapper
+    // leaks only a few ints and leaves the filter in place.
+    let link = prog.take_link(link_id)?;
+    std::mem::forget(link);
 
     for name in MAPS {
         bpf.map(name)
@@ -166,7 +193,8 @@ pub fn detach(iface: &str) -> Result<()> {
             println!("detached {PROG_NAME} from {iface}");
             Ok(())
         }
-        Err(e) if e.to_string().to_ascii_lowercase().contains("not found") => {
+        // The io error's Display is just the program name; match the kind.
+        Err(tc::TcError::IoError(e)) if e.kind() == std::io::ErrorKind::NotFound => {
             println!("nothing to detach on {iface}");
             Ok(())
         }
