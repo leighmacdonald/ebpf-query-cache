@@ -1,0 +1,52 @@
+[package]
+name = "a2scache-bpf"
+description = "TC ingress eBPF program: A2S cache, challenge synthesis, rate limiting"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aya-ebpf = { workspace = true }
+a2s-protocol = { workspace = true }
+
+# Build-seed dependencies (never compiled: dev-deps don't apply to
+# `cargo build`). Nightly's `-Z build-std=core` resolves the sysroot graph
+# against rust-src's library/Cargo.lock pins, and the hermetic `nix build`
+# can only use crates present in our Cargo.lock/vendor dir. Each entry below
+# pins one sysroot crate (sourced from rust-src's library/Cargo.lock) so the
+# sandbox stays offline. When the nightly toolchain is updated and sysroot
+# pins move, the sandbox build fails with "locked to <ver>" / "no matching
+# package" errors naming the crate(s) to re-pin here.
+[dev-dependencies]
+rustc-literal-escaper = "=0.0.8"
+cfg-if = "=1.0.4"
+libc = "=0.2.189"
+addr2line = "=0.27.1"
+adler2 = "=2.0.1"
+cc = "=1.4.3"
+dlmalloc = "=0.2.14"
+find-msvc-tools = "=0.1.11"
+fortanix-sgx-abi = "=0.6.1"
+getopts = "=0.2.24"
+gimli = "=0.34.0"
+hermit-abi = "=0.5.3"
+miniz_oxide = "=0.9.1"
+moto-rt = "=0.17.4"
+r-efi = "=5.3.0"
+r-efi-alloc = "=2.1.0"
+rand = "=0.9.5"
+rand_core = "=0.9.5"
+rand_xorshift = "=0.4.0"
+rustc-demangle = "=0.1.28"
+shlex = "=2.0.1"
+std_detect = "=0.1.5"
+unwinding = "=0.2.10"
+vex-sdk = "=0.27.1"
+wasip1 = "=1.0.0"
+wasip2 = "=2.0.1"
+wasip3 = "=0.9.0"
+wit-bindgen = "=0.62.0"
+
+[[bin]]
+name = "a2scache-bpf"
+path = "src/main.rs"

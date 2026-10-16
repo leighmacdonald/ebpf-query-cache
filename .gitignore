@@ -1,0 +1,13 @@
+.tmp/
+build/
+target/
+*.o
+*.obj
+*.elf
+*.bpf.o
+result
+result-*
+*.swp
+*~
+.DS_Store
+*.md

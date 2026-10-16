@@ -1,0 +1,22 @@
+[package]
+name = "a2scache"
+description = "Userspace CLI and refresh daemon for the eBPF A2S query cache"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aya = { workspace = true }
+a2s-protocol = { workspace = true }
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+libc = "0.2"
+thiserror = "2"
+env_logger = "0.11"
+log = "0.4"
+
+[dev-dependencies]
+# Pinned to the version aya 0.14 uses, so the ELF regression test parses
+# exactly what the loader will see.
+aya-obj = "=0.3.0"

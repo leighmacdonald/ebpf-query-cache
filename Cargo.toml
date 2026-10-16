@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/a2s-protocol",
+    "crates/a2scache-bpf",
+    "crates/a2scache",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+a2s-protocol = { path = "crates/a2s-protocol" }
+aya = "0.14.0"
+aya-ebpf = "0.2.1"
+
+# Vendored aya-obj with relocation fixes (see vendor/aya-obj/README...).
+# Version must stay in sync with what aya 0.14 requires (^0.3).
+[patch.crates-io]
+aya-obj = { path = "vendor/aya-obj" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

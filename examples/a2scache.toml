@@ -1,0 +1,37 @@
+# Example a2scache refresh-daemon config.
+#
+# Install to /etc/a2scache.toml (`just install` does this), edit the
+# [[server]] entries to point at your TF2 backends, then:
+#   a2scache attach <iface> && a2scache serve --config /etc/a2scache.toml
+
+[bpf]
+# Directory holding the pinned maps + program (must match --pin-dir).
+pin_dir = "/sys/fs/bpf/a2scache"
+
+[defaults]
+# How long the BPF program serves an entry before passing through (seconds).
+# `attach --ttl-sec` sets an initial value; serve overwrites it with this.
+ttl_secs = 30
+# Time between refresh cycles per backend (seconds). Keep well below ttl_secs.
+interval_secs = 10
+# Per-datagram receive timeout for the challenge dance (milliseconds, >= 100).
+timeout_ms = 2000
+# Token-bucket rate limits, in milli-tokens (see `a2scache status`).
+per_ip_capacity = 10000
+per_ip_refill_per_s = 2000
+global_capacity = 200000
+global_refill_per_s = 50000
+
+# One entry per backend. The BPF cache key is (ip, port), so two servers on
+# the same host need one entry per port. `mac` is optional: when set, the
+# first server's MAC becomes the source MAC of synthesized replies
+# (otherwise the MAC recorded by `attach` is kept).
+
+[[server]]
+ip = "127.0.0.1"
+port = 27015
+# mac = "aa:bb:cc:dd:ee:ff"
+
+[[server]]
+ip = "127.0.0.1"
+port = 27016
