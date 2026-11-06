@@ -3,10 +3,11 @@
 # clippy gate the release. The release tag is the full commit SHA, so one
 # release per commit never collides; the newest one is marked latest.
 #
-# Nix is installed per-job with the official install script in single-user
-# mode (no daemon, no sudo, no third-party action); /nix/store is then
-# restored from a cache keyed on flake.lock so the toolchain closure
-# (nixpkgs + pinned fenix nightly) is not re-downloaded on every run.
+# Nix is installed with cachix/install-nix-action in single-user mode
+# (--no-daemon: supported on hosted Linux runners). The runner user then
+# owns /nix, so the /nix/store cache (keyed on flake.lock) can be saved
+# and restored without sudo. The action already enables the flakes and
+# nix-command experimental features.
 
 name: Release
 
@@ -31,16 +32,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Nix (single-user)
-        run: |
-          curl -L --proto '=https' --tlsv1.2 https://nixos.org/nix/install -o nix-install
-          sh nix-install --no-daemon --no-confirm
-          # Flakes need the experimental features; enable them for this user.
-          mkdir -p "$HOME/.config/nix"
-          grep -qs 'experimental-features' "$HOME/.config/nix/nix.conf" || \
-            echo 'experimental-features = nix-command flakes' >> "$HOME/.config/nix/nix.conf"
-          echo "/nix/bin" >> "$GITHUB_PATH"
-          PATH=/nix/bin:$PATH nix --version
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          install_options: --no-daemon
+
+      - name: Verify Nix
+        run: nix --version
 
       - name: Cache nix store
         uses: actions/cache@v4
@@ -64,16 +62,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Nix (single-user)
-        run: |
-          curl -L --proto '=https' --tlsv1.2 https://nixos.org/nix/install -o nix-install
-          sh nix-install --no-daemon --no-confirm
-          # Flakes need the experimental features; enable them for this user.
-          mkdir -p "$HOME/.config/nix"
-          grep -qs 'experimental-features' "$HOME/.config/nix/nix.conf" || \
-            echo 'experimental-features = nix-command flakes' >> "$HOME/.config/nix/nix.conf"
-          echo "/nix/bin" >> "$GITHUB_PATH"
-          PATH=/nix/bin:$PATH nix --version
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          install_options: --no-daemon
+
+      - name: Verify Nix
+        run: nix --version
 
       - name: Cache nix store
         uses: actions/cache@v4
