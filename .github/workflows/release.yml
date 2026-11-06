@@ -2,6 +2,11 @@
 # Release for every commit to master (plus manual dispatch). Unit tests and
 # clippy gate the release. The release tag is the full commit SHA, so one
 # release per commit never collides; the newest one is marked latest.
+#
+# Nix is installed per-job with the official install script in single-user
+# mode (no daemon, no sudo, no third-party action); /nix/store is then
+# restored from a cache keyed on flake.lock so the toolchain closure
+# (nixpkgs + pinned fenix nightly) is not re-downloaded on every run.
 
 name: Release
 
@@ -26,28 +31,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Nix
-        uses: Swatinem/setup-nix@main
-        with:
-          # Build outputs manually below; the action's default `nix build`
-          # would evaluate every flake package (including aarch64).
-          nix_build: false
-          extra_nix_config: |
-            extra-experimental-features = nix-command flakes
+      - name: Install Nix (single-user)
+        run: |
+          curl -L --proto '=https' --tlsv1.2 https://nixos.org/nix/install -o nix-install
+          sh nix-install --no-daemon --no-confirm
+          # Flakes need the experimental features; enable them for this user.
+          mkdir -p "$HOME/.config/nix"
+          grep -qs 'experimental-features' "$HOME/.config/nix/nix.conf" || \
+            echo 'experimental-features = nix-command flakes' >> "$HOME/.config/nix/nix.conf"
+          echo "/nix/bin" >> "$GITHUB_PATH"
+          PATH=/nix/bin:$PATH nix --version
 
       - name: Cache nix store
         uses: actions/cache@v4
         with:
-          path: /nix
+          path: /nix/store
           key: nix-store-${{ runner.os }}-${{ hashFiles('flake.lock') }}
           restore-keys: |
             nix-store-${{ runner.os }}-
 
       - name: Unit tests
-        run: nix develop --command just test
+        run: nix develop --command bash -uc 'mkdir -p .tmp && just test'
 
       - name: Clippy
-        run: nix develop --command just lint
+        run: nix develop --command bash -uc 'mkdir -p .tmp && just lint'
 
   release:
     name: Build + GitHub Release
@@ -57,17 +64,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Nix
-        uses: Swatinem/setup-nix@main
-        with:
-          nix_build: false
-          extra_nix_config: |
-            extra-experimental-features = nix-command flakes
+      - name: Install Nix (single-user)
+        run: |
+          curl -L --proto '=https' --tlsv1.2 https://nixos.org/nix/install -o nix-install
+          sh nix-install --no-daemon --no-confirm
+          # Flakes need the experimental features; enable them for this user.
+          mkdir -p "$HOME/.config/nix"
+          grep -qs 'experimental-features' "$HOME/.config/nix/nix.conf" || \
+            echo 'experimental-features = nix-command flakes' >> "$HOME/.config/nix/nix.conf"
+          echo "/nix/bin" >> "$GITHUB_PATH"
+          PATH=/nix/bin:$PATH nix --version
 
       - name: Cache nix store
         uses: actions/cache@v4
         with:
-          path: /nix
+          path: /nix/store
           key: nix-store-${{ runner.os }}-${{ hashFiles('flake.lock') }}
           restore-keys: |
             nix-store-${{ runner.os }}-
