@@ -1,0 +1,121 @@
+# Build the static a2scache binary via the nix flake and publish a GitHub
+# Release for every commit to master (plus manual dispatch). Unit tests and
+# clippy gate the release. The release tag is the full commit SHA, so one
+# release per commit never collides; the newest one is marked latest.
+
+name: Release
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  # Never cancel an in-progress release; queue later commits behind it.
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Unit tests + clippy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: Swatinem/setup-nix@main
+        with:
+          # Build outputs manually below; the action's default `nix build`
+          # would evaluate every flake package (including aarch64).
+          nix_build: false
+          extra_nix_config: |
+            extra-experimental-features = nix-command flakes
+
+      - name: Cache nix store
+        uses: actions/cache@v4
+        with:
+          path: /nix
+          key: nix-store-${{ runner.os }}-${{ hashFiles('flake.lock') }}
+          restore-keys: |
+            nix-store-${{ runner.os }}-
+
+      - name: Unit tests
+        run: nix develop --command just test
+
+      - name: Clippy
+        run: nix develop --command just lint
+
+  release:
+    name: Build + GitHub Release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: Swatinem/setup-nix@main
+        with:
+          nix_build: false
+          extra_nix_config: |
+            extra-experimental-features = nix-command flakes
+
+      - name: Cache nix store
+        uses: actions/cache@v4
+        with:
+          path: /nix
+          key: nix-store-${{ runner.os }}-${{ hashFiles('flake.lock') }}
+          restore-keys: |
+            nix-store-${{ runner.os }}-
+
+      - name: Build a2scache
+        run: nix build .#a2scache --print-out-paths > out-path.txt
+
+      - name: Commit metadata
+        id: meta
+        run: |
+          echo "short=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "subject=$(git log -1 --pretty=%s)" >> "$GITHUB_OUTPUT"
+
+      - name: Assemble release assets
+        run: |
+          set -euo pipefail
+          OUT=$(head -n1 out-path.txt)
+          mkdir -p dist
+          install -m 0755 "$OUT/bin/a2scache" dist/a2scache
+          install -m 0644 packaging/a2scache-attach@.service dist/
+          install -m 0644 packaging/a2scache-daemon.service dist/
+          install -m 0644 examples/a2scache.toml dist/a2scache.toml.example
+          (cd dist && sha256sum a2scache 'a2scache-attach@.service' \
+              a2scache-daemon.service a2scache.toml.example > SHA256SUMS)
+          ls -l dist
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.sha }}
+          name: a2scache ${{ steps.meta.outputs.short }}
+          body: |
+            ${{ steps.meta.outputs.subject }}
+
+            _Auto-released from `master` @ `${{ github.sha }}`._
+
+            ## Install (x86_64 Linux, kernel >= 5.7)
+
+            ```sh
+            sudo install -Dm 0755 a2scache /usr/local/bin/a2scache
+            sudo install -Dm 0644 a2scache-attach@.service a2scache-daemon.service /etc/systemd/system/
+            sudo install -Dm 0644 a2scache.toml.example /etc/a2scache.toml   # then edit
+            sudo systemctl daemon-reload
+            sudo systemctl enable --now a2scache-attach@<iface> a2scache-daemon
+            ```
+
+            Fully static musl binary with the BPF ELF embedded (no Nix or
+            Rust toolchain needed on the target); validated on Ubuntu 24.04
+            (kernel 6.8) and 26.04 (kernel 7.x).
+          files: dist/*
+          fail_on_unmatched_files: true
