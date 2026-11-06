@@ -470,7 +470,6 @@ fn write_config(pin_dir: &Path, cfg: &FileConfig, backends: &[Backend]) -> Resul
         global_capacity: d.global_capacity,
         global_refill_per_s: d.global_refill_per_s,
         backend_mac: mac,
-        ..Config::default()
     };
     array.set(0, new, 0)?;
     if new.ifindex_out == 0 {
