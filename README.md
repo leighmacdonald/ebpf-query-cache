@@ -41,7 +41,8 @@ with a nix flake; targets Linux kernels 6.x and 7.x (Ubuntu 24.04 /
                                    synthesize reply:              │
                                    challenge / INFO / PLAYER      │
                                    rewrite skb in place,          │
-                                   redirect to peer, count        │
+                                   redirect (mode by topology),   │
+                                   count                           │
                                                                   │
  daemon (userspace, one thread per backend) ──> challenge dance ──> game server
    refreshes CacheEntry every interval (< TTL)                    (only this traffic
@@ -65,10 +66,26 @@ Per-packet decisions (all counters exposed by `a2scache stats`):
 Reply rewrite: the program resizes the skb to the cached datagram and
 stores a full Ethernet frame — MACs swapped (client ← server), IP
 src/dst swapped, UDP ports swapped, IP total length + UDP length set,
-IP and UDP checksums recomputed with `bpf_csum_diff` — then
-`bpf_redirect_peer(ifindex_out, 0)` re-injects it on the same
-interface's peer so the kernel delivers it to the client. The returned
-verdict is the helper's own return value (see *Kernel compatibility*).
+IP and UDP checksums recomputed with `bpf_csum_diff` — then delivers it
+with a redirect helper chosen by `Config.redirect_mode` (see below).
+The returned verdict is the helper's own return value (see *Kernel
+compatibility*).
+
+Reply delivery mode (`redirect_mode` in the config map): the mode is
+picked by `attach` from the interface's topology and stored in the
+config map, so it survives daemon restarts.
+
+- **`peer` (0)** — `bpf_redirect_peer(ifindex_out, 0)`: re-injects the
+  frame on the interface's *in-kernel peer* (veth/netkit) receive path.
+  Selected when `/sys/class/net/<iface>/iflink` names a device other
+  than the interface itself (the peer's ifindex; devices without a peer
+  report their own ifindex there).
+- **`xmit` (1)** — `bpf_redirect(ifindex_out, 0)`: transmits the frame
+  on the same interface's egress, out to the wire. Selected for real
+  NICs, bridges, etc. This is required there: `bpf_redirect_peer` on a
+  device without `ndo_get_peer_dev` records the target and the kernel
+  then silently `kfree()`s the frame in `skb_do_redirect()` (see
+  *Troubleshooting*).
 
 ## Requirements
 
@@ -204,18 +221,31 @@ Program type TC on clsact (4.10). Ubuntu 24.04 (6.8) and 26.04 (7.x)
 both qualify; validated on 7.0.11.
 - **TC action enum renumbering (6.x → 7.0)**: `TC_ACT_REDIRECT` was
 `0x20000000` on 6.x and became `7` in 7.0's uapi. The program does not
-compare against any redirect constant: it returns `bpf_redirect_peer`'s
-return value verbatim as the verdict, and treats only
+compare against any redirect constant: it returns the redirect
+helper's return value verbatim as the verdict, and treats only
 `TC_ACT_SHOT` (= 2, stable) as failure. This makes the object load on
 both kernel generations.
 - **L2 at TC ingress**: `skb->data` is the Ethernet frame (MAC header
 first); the kernel pulls L2 after TC. The program therefore reads and
 writes full frames (offsets: MAC 0-13, IPv4 14-33, UDP 34-41).
-- **`bpf_redirect_peer` re-entry**: with flags 0 the redirect re-enters
-the receive path on the target (peer) side via `-EAGAIN`
+- **`peer` mode re-entry**: with flags 0 `bpf_redirect_peer`
+re-enters the receive path on the target (peer) side via `-EAGAIN`
 (`another_round`), bypassing the `bpf_redirect` mac_header check —
 that is how the synthesized reply is delivered to the client without
-going through the host IP stack.
+going through the host IP stack. Only works on devices with an
+in-kernel peer (`ndo_get_peer_dev`: veth, netkit).
+- **`xmit` mode on real NICs**: both helpers only *record* the target
+in the per-CPU `bpf_redirect_info`; the actual redirect runs in
+`skb_do_redirect()` once the program's `TC_ACT_REDIRECT` verdict is
+processed, and for the ingress verdict the TC core first pushes
+`mac_len` back, so the skb carries the full L2 header. For a device
+without a peer, `bpf_redirect_peer` would `kfree()` the frame there
+(silent drop). Plain `bpf_redirect(ifindex, 0)` instead transmits on
+the same interface's egress (`__bpf_tx_skb` → `dev_queue_xmit`): the
+"link layer header is carried" check
+(`mac_header < network_header`) holds for driver-built skbs whose
+`mac_header` is unset (`HARDHEADER`), and the frame is a complete
+Ethernet frame, so it is sent out to the wire to the client.
 - **Checksum endianness**: kernel csum helpers (`do_csum`/
 `csum_partial` behind `bpf_csum_diff`) sum *native-endian* words and
 the result is stored natively (`ip->check = ip_fast_csum(...)`). The
@@ -257,6 +287,12 @@ the pins from `attach`; it retries with backoff until they exist.
 pass-through reply isn't completing the dance: the server is
 wildcard-bound and sources replies with the egress interface's
 address; re-aim `[[server]].ip` (see *Configuration* notes).
+- **Client sees nothing, `sent_challenge_*` grows, but no drop counter
+moves** — the synthesized reply is being kfree'd by the kernel *after*
+the program returns: `bpf_redirect_peer` was used on a device without
+an in-kernel peer (real NIC/bridge). `attach` picks the mode from the
+topology (`iflink` vs `ifindex`); if the interface changed kind
+(veth → physical), re-run `attach` so the config map is rewritten.
 - **`serve` can't warm a backend, works from another machine** — you
 configured `127.0.0.1`; Source ignores A2S from `127/8`.
 - **`dropped_stale` high** — `interval_secs` too close to `ttl_secs`, or

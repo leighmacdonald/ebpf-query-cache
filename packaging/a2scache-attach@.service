@@ -11,9 +11,12 @@ RemainAfterExit=yes
 # the daemon unit is independent and retries until the pins exist).
 ExecStart=/usr/local/bin/a2scache attach %i
 ExecStop=/usr/local/bin/a2scache detach %i
-# attach: clsact qdisc (NET_ADMIN) + BPF program load/attach (BPF)
-AmbientCapabilities=CAP_BPF CAP_NET_ADMIN
-CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN
+# attach: clsact qdisc (NET_ADMIN) + BPF program load/attach (BPF).
+# CAP_SYS_ADMIN is required for the verifier load: the program does
+# stack-pointer arithmetic the verifier only accepts from root
+# ("pointer arithmetic with it prohibited for !root").
+AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_SYS_ADMIN
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

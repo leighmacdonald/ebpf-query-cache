@@ -274,6 +274,19 @@ impl Default for CacheEntry {
     }
 }
 
+/// How the program delivers a synthesized reply on `ifindex_out`.
+///
+/// - [`REDIRECT_MODE_PEER`]: `bpf_redirect_peer` — ingress-to-ingress
+///   delivery to the device's in-kernel peer (veth/netkit pair). The reply
+///   reaches whatever client sits on the other end of the pair.
+/// - [`REDIRECT_MODE_XMIT`]: `bpf_redirect` on the same ifindex — the
+///   rewritten frame is transmitted on the interface's egress (to the wire).
+///   Required for real NICs, which have no in-kernel peer: `bpf_redirect_peer`
+///   there records the target and the kernel silently drops the frame in
+///   `skb_do_redirect` after the program has returned.
+pub const REDIRECT_MODE_PEER: u32 = 0;
+pub const REDIRECT_MODE_XMIT: u32 = 1;
+
 /// Global program configuration, written by the daemon.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -282,7 +295,10 @@ pub struct Config {
     pub ifindex_out: u32,
     pub ttl_ns: u64,
     pub max_payload: u32,
-    pub _pad0: u32,
+    /// Reply delivery mode (REDIRECT_MODE_*), picked by `attach` from the
+    /// interface topology. Sits in the former reserved `_pad0` slot, so the
+    /// struct size/alignment are unchanged.
+    pub redirect_mode: u32,
     /// Per-source-IP bucket capacity (milli-tokens).
     pub per_ip_capacity: u32,
     /// Per-source-IP refill rate (milli-tokens per second).
@@ -300,7 +316,7 @@ impl Default for Config {
             ifindex_out: 0,
             ttl_ns: 30_000_000_000,
             max_payload: MAX_PAYLOAD as u32,
-            _pad0: 0,
+            redirect_mode: REDIRECT_MODE_PEER,
             per_ip_capacity: 10_000,
             per_ip_refill_per_s: 2_000,
             global_capacity: 200_000,

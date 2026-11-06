@@ -21,9 +21,9 @@ use std::thread;
 use std::time::Duration;
 
 use a2s_protocol::{
-    CacheEntry, Config, MAX_PAYLOAD, NO_CHALLENGE, Reassembler, TYPE_CHALLENGE, TYPE_INFO_RESP,
-    TYPE_PLAYER_RESP, build_info_request, build_info_request_challenged, build_player_request,
-    cache_key, is_fragment, response_type,
+    build_info_request, build_info_request_challenged, build_player_request, cache_key,
+    is_fragment, response_type, CacheEntry, Config, Reassembler, MAX_PAYLOAD, NO_CHALLENGE,
+    TYPE_CHALLENGE, TYPE_INFO_RESP, TYPE_PLAYER_RESP,
 };
 use aya::maps::{Array, HashMap, Map, MapData};
 use serde::Deserialize;
@@ -462,6 +462,9 @@ fn write_config(pin_dir: &Path, cfg: &FileConfig, backends: &[Backend]) -> Resul
         ifindex_out: old.ifindex_out,
         ttl_ns: d.ttl_secs.saturating_mul(1_000_000_000),
         max_payload: MAX_PAYLOAD as u32,
+        // Picked by `attach` from the interface topology; `Config::default`
+        // would reset it to PEER, breaking reply delivery on real NICs.
+        redirect_mode: old.redirect_mode,
         per_ip_capacity: d.per_ip_capacity,
         per_ip_refill_per_s: d.per_ip_refill_per_s,
         global_capacity: d.global_capacity,

@@ -54,10 +54,16 @@ VH=a2s-h
 VT=a2s-t
 IP_H=10.200.1.1
 IP_T=10.200.1.2
-# Ports deliberately distinct from 27015/27016: a real srcds may bind
-# 0.0.0.0:27015 on the same host.
+# Backend ports. Deliberately distinct from 27015/27016 first (a real srcds
+# may bind 0.0.0.0:27015 on the same host). Host firewalls may drop INPUT
+# UDP to arbitrary ports (NixOS default-deny), which would silently kill
+# scenario 4's pass-through replies, so the harness probes each candidate
+# pair with a real datagram dance before using it (below); the fallback
+# pair uses the standard A2S port and the GBANS port, the ones such
+# firewalls typically whitelist for game-adjacent traffic.
 PORT_A=27115
 PORT_B=27116
+PORT_PAIRS=("27115 27116" "27015 27715")
 TTL=8
 
 SCRATCH=$(mktemp -d /tmp/a2scache-e2e.XXXXXX)
@@ -146,6 +152,46 @@ ip netns exec "$NS" ip link set "$VT" up
 ip netns exec "$NS" ip route add default via "$IP_H"
 ip addr add "$IP_H/24" dev "$VH"
 ip link set "$VH" up
+
+# --- port reachability probe ------------------------------------------------
+# Pass-through replies from the backends traverse the host's INPUT chain. A
+# host firewall that drops INPUT UDP to arbitrary ports (e.g. NixOS
+# default-deny) would silently eat scenario 4's stale query. Probe each
+# candidate pair with a real unchallenged-INFO dance from the netns (BPF is
+# not attached yet, so this is a pure netns->veth->host-IP-stack round trip)
+# and use the first pair that completes.
+probe_port() {
+	local port=$1 pid ok=1
+	python3 "$SCRIPT_DIR/fake_server.py" --bind "$IP_H" --port "$port" \
+		--name probe --players 1 --counter "$SCRATCH/probe-cnt" \
+		>"$SCRATCH/probe.log" 2>&1 &
+	pid=$!
+	sleep 0.3
+	if ! kill -0 "$pid" 2>/dev/null; then
+		return 1 # bind failed (port already in use on $IP_H)
+	fi
+	ip netns exec "$NS" python3 "$SCRIPT_DIR/client.py" info "$IP_H:$port" \
+		--timeout 2 >/dev/null 2>&1 || ok=0
+	kill "$pid" 2>/dev/null || true
+	wait "$pid" 2>/dev/null || true
+	[ "$ok" = 1 ]
+}
+
+PICKED=0
+for pair in "${PORT_PAIRS[@]}"; do
+	read -r PA PB <<<"$pair"
+	if probe_port "$PA" && probe_port "$PB"; then
+		PORT_A=$PA
+		PORT_B=$PB
+		PICKED=1
+		break
+	fi
+done
+[ "$PICKED" = 1 ] || {
+	echo "e2e: no reachable A2S port pair (host firewall dropping INPUT UDP?)" >&2
+	exit 1
+}
+echo "e2e: backend ports $PORT_A / $PORT_B (probe ok)"
 
 echo "e2e: starting fake TF2 backends on $IP_H"
 python3 "$SCRIPT_DIR/fake_server.py" --bind "$IP_H" --port "$PORT_A" \

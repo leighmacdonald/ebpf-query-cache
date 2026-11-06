@@ -6,6 +6,10 @@ After=network-online.target
 
 [Service]
 Type=simple
+# The daemon logs refresh failures at WARN (e.g. backend down); without
+# RUST_LOG env_logger defaults to error-level and those vanish from the
+# journal.
+Environment=RUST_LOG=info
 ExecStart=/usr/local/bin/a2scache serve --config /etc/a2scache.toml
 Restart=on-failure
 RestartSec=2

@@ -9,20 +9,20 @@
 #![no_main]
 
 use a2s_protocol::{
-    CHALLENGE_RESP_LEN, CacheEntry, Config, INFO_BODY, INFO_REQ_LEN, INFO_REQ_LEN_CHALLENGED,
-    MAGIC, MAX_PAYLOAD, NO_CHALLENGE, PLAYER_REQ_LEN, RateEntry, TYPE_CHALLENGE, TYPE_INFO_REQ,
-    TYPE_PLAYER_REQ, cache_key, stats,
+    cache_key, stats, CacheEntry, Config, RateEntry, CHALLENGE_RESP_LEN, INFO_BODY, INFO_REQ_LEN,
+    INFO_REQ_LEN_CHALLENGED, MAGIC, MAX_PAYLOAD, NO_CHALLENGE, PLAYER_REQ_LEN, REDIRECT_MODE_XMIT,
+    TYPE_CHALLENGE, TYPE_INFO_REQ, TYPE_PLAYER_REQ,
 };
 use aya_ebpf::{
-    EbpfContext,
     bindings::{__be32, __sk_buff},
     helpers::{
-        bpf_csum_diff, bpf_get_prandom_u32, bpf_ktime_get_ns, bpf_redirect_peer,
+        bpf_csum_diff, bpf_get_prandom_u32, bpf_ktime_get_ns, bpf_redirect, bpf_redirect_peer,
         bpf_skb_change_tail, bpf_skb_load_bytes, bpf_skb_store_bytes,
     },
     macros::{classifier, map},
     maps::{Array, HashMap, PerCpuArray},
     programs::TcContext,
+    EbpfContext,
 };
 
 const TC_ACT_OK: i32 = 0;
@@ -563,25 +563,33 @@ fn serve_response(
         return TC_ACT_SHOT;
     }
 
-    // bpf_redirect_peer delivers the rewritten frame directly to the veth
-    // peer's receive path (BPF_F_PEER): the kernel re-enters receive
-    // processing on the peer device, re-running post-TC L2 handling. Plain
-    // bpf_redirect cannot be used here because the peer-side receive state
-    // (mac_header == network_header == data, i.e. L2 not yet pulled) fails
-    // __bpf_redirect_common's "link layer header is carried" check.
-    //
-    // The helper returns the verdict: TC_ACT_REDIRECT on success,
-    // TC_ACT_SHOT on error. The program must itself return TC_ACT_REDIRECT
-    // for the kernel to act.
-    // bpf_redirect_peer with flags 0 cannot fail: it either records the
-    // peer target and returns the kernel's TC_ACT_REDIRECT verdict, or
-    // returns TC_ACT_SHOT (2, stable across kernel versions).
-    //
-    // TC_ACT_REDIRECT was renumbered in newer kernels (0x20000000 on
-    // 6.x, 7 on 7.x), so the verdict is passed through verbatim instead
-    // of being re-emitted from a local constant; only the SHOT case is
+    // Deliver the rewritten frame. Both helpers only *record* the target in
+    // the per-CPU bpf_redirect_info and return the kernel's TC_ACT_REDIRECT
+    // verdict verbatim (or TC_ACT_SHOT on bad arguments); the actual
+    // redirect runs in skb_do_redirect() once our returned verdict is
+    // TC_ACT_REDIRECT, so the return value is passed through below instead
+    // of being re-emitted from a local constant (TC_ACT_REDIRECT's value
+    // was renumbered in newer kernels). Only the SHOT case is
     // distinguishable and needs handling.
-    let ret = unsafe { bpf_redirect_peer(cfg.ifindex_out, 0) };
+    //
+    // REDIRECT_MODE_PEER (veth/netkit): BPF_F_PEER makes skb_do_redirect
+    // cross the pair to the peer device's receive path. Proven by e2e.
+    //
+    // REDIRECT_MODE_XMIT (real NIC): plain bpf_redirect transmits the
+    // frame on the same interface's egress (to the wire). This is required
+    // because physical NICs have no in-kernel peer: with BPF_F_PEER,
+    // skb_get_peer_dev() (ndo_get_peer_dev) returns NULL and the kernel
+    // silently kfree()s the frame in skb_do_redirect(). At the verdict the
+    // skb still carries the L2 header (data = start of the Ethernet
+    // header; the ingress path pushes mac_len back on the TC_ACT_REDIRECT
+    // verdict), which is what __bpf_redirect_common's "link layer header is
+    // carried" check requires: it holds for driver-built skbs, whose
+    // mac_header is unset (HARDHEADER) and thus < network_header.
+    let ret = if cfg.redirect_mode == REDIRECT_MODE_XMIT {
+        unsafe { bpf_redirect(cfg.ifindex_out, 0) }
+    } else {
+        unsafe { bpf_redirect_peer(cfg.ifindex_out, 0) }
+    };
     if ret == i64::from(TC_ACT_SHOT) {
         inc_stat(stats::DROPPED_REWRITE_REDIRECT);
         return TC_ACT_SHOT;

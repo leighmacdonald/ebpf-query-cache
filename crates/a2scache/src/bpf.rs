@@ -2,11 +2,14 @@ use std::ffi::CString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use a2s_protocol::{CacheEntry, Config, MAX_PAYLOAD, cache_key_unpack, stats};
-use aya::EbpfLoader;
+use a2s_protocol::{
+    cache_key_unpack, stats, CacheEntry, Config, MAX_PAYLOAD, REDIRECT_MODE_PEER,
+    REDIRECT_MODE_XMIT,
+};
 use aya::maps::{Array, HashMap, Map, MapData, PerCpuArray};
 use aya::programs::tc;
 use aya::programs::{SchedClassifier, TcAttachType};
+use aya::EbpfLoader;
 
 use crate::{Error, Result};
 
@@ -104,6 +107,39 @@ pub(crate) fn now_ns() -> Result<u64> {
     Ok(ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64)
 }
 
+/// Reply delivery mode for an interface, from its topology.
+///
+/// A veth (or netkit) pair has an in-kernel peer reachable via
+/// `bpf_redirect_peer`, which delivers synthesized replies across the pair
+/// to the peer's receive path. Sysfs exposes the peer's ifindex in
+/// `/sys/class/net/<iface>/iflink`; devices without a peer (real NICs,
+/// bridges) report their *own* ifindex there (`dev_get_iflink` falls back
+/// to it), so the two values differ exactly when a peer exists. This
+/// matters because without a peer `skb_do_redirect()` cannot resolve
+/// `skb_get_peer_dev()` (no `ndo_get_peer_dev`) and silently kfree()s the
+/// frame, so those devices need XMIT mode (`bpf_redirect` on the same
+/// ifindex transmits the frame on the interface's egress, out to the wire).
+fn redirect_mode_for(iface: &str) -> u32 {
+    let read = |name: &str| {
+        fs::read_to_string(format!("/sys/class/net/{iface}/{name}"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+    };
+    match (read("ifindex"), read("iflink")) {
+        (Some(idx), Some(link)) if link != idx => REDIRECT_MODE_PEER,
+        _ => REDIRECT_MODE_XMIT,
+    }
+}
+
+/// Human-readable name of a reply delivery mode.
+pub fn redirect_mode_name(mode: u32) -> &'static str {
+    match mode {
+        REDIRECT_MODE_XMIT => "xmit (bpf_redirect to egress)",
+        REDIRECT_MODE_PEER => "peer (bpf_redirect_peer to veth peer)",
+        _ => "unknown",
+    }
+}
+
 pub fn attach(elf: &[u8], iface: &str, pin_dir: &Path, ttl_sec: u64) -> Result<()> {
     fs::create_dir_all(pin_dir)?;
 
@@ -170,6 +206,7 @@ pub fn attach(elf: &[u8], iface: &str, pin_dir: &Path, ttl_sec: u64) -> Result<(
         enabled: 1,
         ifindex_out: iface_index(iface)?,
         ttl_ns: ttl_sec.saturating_mul(1_000_000_000),
+        redirect_mode: redirect_mode_for(iface),
         backend_mac: iface_mac(iface)?,
         ..Config::default()
     };
@@ -181,7 +218,8 @@ pub fn attach(elf: &[u8], iface: &str, pin_dir: &Path, ttl_sec: u64) -> Result<(
 
     println!(
         "attached {PROG_NAME} on {iface} (ingress); pins in {pin_dir:?}; \
-         ttl {ttl_sec}s, max_payload {MAX_PAYLOAD} B"
+         ttl {ttl_sec}s, max_payload {MAX_PAYLOAD} B, redirect_mode={}",
+        redirect_mode_name(cfg.redirect_mode)
     );
     println!("run `a2scache serve --config <file>` to populate the cache");
     Ok(())
@@ -231,6 +269,10 @@ pub fn status(pin_dir: &Path) -> Result<()> {
     println!("config:");
     println!("  enabled       : {}", cfg.enabled);
     println!("  ifindex_out   : {}", cfg.ifindex_out);
+    println!(
+        "  redirect_mode : {}",
+        redirect_mode_name(cfg.redirect_mode)
+    );
     println!("  ttl           : {} s", cfg.ttl_ns / 1_000_000_000);
     println!("  max_payload   : {}", cfg.max_payload);
     println!(
