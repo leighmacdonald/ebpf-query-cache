@@ -1,7 +1,9 @@
 # Build the static a2scache binary via the nix flake and publish a GitHub
 # Release for every commit to master (plus manual dispatch). Unit tests and
-# clippy gate the release. The release tag is the full commit SHA, so one
-# release per commit never collides; the newest one is marked latest.
+# clippy gate the release. Releases are tagged v1, v2, ... — an
+# auto-incremented number taken from the existing tags at publish time
+# (GitHub rejects tags that look like commit SHAs, so the SHA itself
+# cannot be the tag). The newest release is marked latest.
 #
 # Nix is installed with cachix/install-nix-action in single-user mode
 # (--no-daemon: supported on hosted Linux runners). The runner user then
@@ -84,8 +86,25 @@ jobs:
       - name: Commit metadata
         id: meta
         run: |
-          echo "short=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
           echo "subject=$(git log -1 --pretty=%s)" >> "$GITHUB_OUTPUT"
+
+      - name: Determine release tag
+        id: tag
+        run: |
+          # GitHub forbids tags made of 40/64 hex chars (they look like
+          # SHAs), so releases get an incremented vN tag instead. The
+          # concurrency group serializes releases per branch, so two
+          # runs cannot claim the same number.
+          max=0
+          while IFS= read -r ref; do
+            name="${ref#refs/tags/}"
+            if [[ "$name" =~ ^v([0-9]+)$ ]]; then
+              n="${BASH_REMATCH[1]}"
+              if (( n > max )); then max=$n; fi
+            fi
+          done < <(git ls-remote --tags origin | sed 's/^[0-9a-f]*\t//')
+          next=$((max + 1))
+          echo "tag=v${next}" >> "$GITHUB_OUTPUT"
 
       - name: Assemble release assets
         run: |
@@ -103,8 +122,8 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.sha }}
-          name: a2scache ${{ steps.meta.outputs.short }}
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: a2scache ${{ steps.tag.outputs.tag }}
           body: |
             ${{ steps.meta.outputs.subject }}
 
