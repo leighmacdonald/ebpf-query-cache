@@ -70,6 +70,10 @@ enum Cmd {
         /// Daemon config file
         #[arg(long, default_value = "/etc/a2scache.toml")]
         config: PathBuf,
+        /// Listen address for the Prometheus /metrics endpoint (wins over
+        /// the config's [metrics] listen; unset = off)
+        #[arg(long)]
+        metrics_listen: Option<String>,
     },
 }
 
@@ -90,7 +94,10 @@ fn main() -> ExitCode {
             kind,
             timeout_ms,
         } => query::run(addr, *kind, *timeout_ms),
-        Cmd::Serve { config } => {
+        Cmd::Serve {
+            config,
+            metrics_listen,
+        } => {
             // An explicit --pin-dir wins; otherwise the daemon config's
             // [bpf] pin_dir applies.
             let override_dir = if cli.pin_dir.as_os_str() != bpf::DEFAULT_PIN_DIR {
@@ -98,7 +105,19 @@ fn main() -> ExitCode {
             } else {
                 None
             };
-            daemon::serve(config, override_dir)
+            let metrics_listen = match metrics_listen {
+                Some(addr) => match addr.parse() {
+                    Ok(a) => Some(a),
+                    Err(_) => {
+                        eprintln!(
+                            "a2scache: error: bad --metrics-listen address `{addr}` (want ip:port)"
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                },
+                None => None,
+            };
+            daemon::serve(config, override_dir, metrics_listen)
         }
     };
 

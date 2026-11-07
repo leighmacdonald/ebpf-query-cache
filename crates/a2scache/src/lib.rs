@@ -1,5 +1,6 @@
 pub mod bpf;
 pub mod daemon;
+pub mod metrics;
 pub mod query;
 
 use aya::include_bytes_aligned;

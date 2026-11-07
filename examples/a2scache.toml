@@ -27,6 +27,13 @@ per_ip_refill_per_s = 2000
 global_capacity = 200000
 global_refill_per_s = 50000
 
+# [metrics]
+# # Listen address for a Prometheus /metrics endpoint. The endpoint is
+# # OFF unless set here or via `a2scache serve --metrics-listen` (the
+# # flag wins). Bind failure logs a warning; the daemon runs on without
+# # metrics.
+# listen = "127.0.0.1:9103"
+
 # One entry per game instance. The BPF cache key is (ip, port): two servers
 # on the same host need one entry per port, and duplicates of the same
 # (ip, port) are rejected. The cache map holds at most

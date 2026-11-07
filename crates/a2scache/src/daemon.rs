@@ -19,7 +19,7 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use a2s_protocol::{
     CACHE_MAX_ENTRIES, CacheEntry, Config, MAX_PAYLOAD, NO_CHALLENGE, Reassembler, TYPE_CHALLENGE,
@@ -30,6 +30,7 @@ use aya::maps::{Array, HashMap, Map, MapData};
 use serde::Deserialize;
 
 use crate::bpf;
+use crate::metrics;
 use crate::{Error, Result};
 
 /// Set once SIGTERM/SIGINT arrives; all threads poll it.
@@ -53,7 +54,18 @@ pub struct FileConfig {
     #[serde(default)]
     pub defaults: DefaultsSection,
     #[serde(default)]
+    pub metrics: MetricsSection,
+    #[serde(default)]
     pub server: Vec<ServerSection>,
+}
+
+/// Optional Prometheus endpoint; the whole section may be omitted, which
+/// leaves the endpoint off (a `serve --metrics-listen` flag always wins).
+#[derive(Debug, Default, Deserialize)]
+pub struct MetricsSection {
+    /// Listen address of the `/metrics` endpoint (e.g.
+    /// `127.0.0.1:9103`).
+    pub listen: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -610,10 +622,19 @@ fn spawn_signal_thread() -> thread::JoinHandle<()> {
     })
 }
 
+/// Unix time now (seconds); 0 if the clock is before the epoch.
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// Refresh loop for one backend. Reopens the cache map on failure so a single
 /// wedged backend (or map hiccup) never kills the daemon. The per-instance
-/// TTL/interval/timeout come from `backend`, not the global defaults.
-fn backend_loop(pin_dir: PathBuf, backend: Backend) {
+/// TTL/interval/timeout come from `backend`, not the global defaults. Every
+/// completed cycle records its outcome in the shared [`metrics`] state.
+fn backend_loop(pin_dir: PathBuf, backend: Backend, states: metrics::BackendStates) {
     let key = cache_key(u32::from(backend.ip), backend.port);
     let timeout = backend.timeout;
     let interval = backend.interval;
@@ -642,6 +663,7 @@ fn backend_loop(pin_dir: PathBuf, backend: Backend) {
             }
         };
 
+        let started = Instant::now();
         let cycle = (|| -> Result<()> {
             let sock = UdpSocket::bind("0.0.0.0:0")?;
             sock.set_read_timeout(Some(timeout))?;
@@ -662,6 +684,20 @@ fn backend_loop(pin_dir: PathBuf, backend: Backend) {
             );
             Ok(())
         })();
+        // Record the cycle in the shared metrics state (poisoned lock:
+        // take ownership; the state is plain data, nothing is corrupted).
+        {
+            let mut guard = states.lock().unwrap_or_else(|p| p.into_inner());
+            let s = guard.entry(backend.label.clone()).or_default();
+            s.up = cycle.as_ref().is_ok();
+            if s.up {
+                s.refreshes_success += 1;
+                s.last_success_unix = unix_now();
+            } else {
+                s.refreshes_failure += 1;
+            }
+            s.last_refresh = started.elapsed();
+        }
         if let Err(e) = cycle {
             log::warn!(
                 "[{}] refresh failed ({e}); retrying in {}s",
@@ -678,7 +714,15 @@ fn backend_loop(pin_dir: PathBuf, backend: Backend) {
 }
 
 /// Run the refresh daemon until SIGTERM/SIGINT.
-pub fn serve(config_path: &Path, pin_dir_override: Option<&Path>) -> Result<()> {
+///
+/// `metrics_listen` is the resolved `/metrics` listen address (the CLI
+/// flag already wins over the config's `[metrics] listen`); `None` runs
+/// without an endpoint.
+pub fn serve(
+    config_path: &Path,
+    pin_dir_override: Option<&Path>,
+    metrics_listen: Option<SocketAddr>,
+) -> Result<()> {
     let (cfg, backends) = load_config(config_path)?;
     log::info!(
         "loaded {} ({} backends)",
@@ -701,10 +745,33 @@ pub fn serve(config_path: &Path, pin_dir_override: Option<&Path>) -> Result<()> 
         return Err(e);
     }
 
+    // The CLI flag takes precedence over the config's [metrics] listen.
+    let metrics_listen = match metrics_listen {
+        Some(addr) => Some(addr),
+        None => cfg
+            .metrics
+            .listen
+            .as_deref()
+            .map(|s| s.parse().map_err(|_| Error::Addr(s.to_string())))
+            .transpose()?,
+    };
+
+    let states = metrics::new_backend_states();
     let mut handles = Vec::with_capacity(backends.len());
-    for b in backends {
+    for b in &backends {
         let pin_dir = pin_dir.clone();
-        handles.push(thread::spawn(move || backend_loop(pin_dir, b)));
+        let backend = b.clone();
+        let states = states.clone();
+        handles.push(thread::spawn(move || {
+            backend_loop(pin_dir, backend, states)
+        }));
+    }
+
+    if let Some(addr) = metrics_listen {
+        // The updater thread owns the exporter for the process lifetime;
+        // a bind failure logs inside start() and the daemon runs on
+        // without metrics.
+        metrics::start(addr, pin_dir.clone(), backends, states);
     }
 
     // Park the main thread until a signal arrives; the waiter sets SHUTDOWN

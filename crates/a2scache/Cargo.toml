@@ -9,6 +9,7 @@ license.workspace = true
 aya = { workspace = true }
 a2s-protocol = { workspace = true }
 clap = { version = "4.5", features = ["derive"] }
+prometheus_exporter = { workspace = true }
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
 libc = "0.2"

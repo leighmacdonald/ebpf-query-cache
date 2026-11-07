@@ -13,6 +13,8 @@
 #      a long-ttl instance stays fresh (served from cache)
 #   8. scale: N game instances (fake backends) cached, isolated, and served
 #      from cache simultaneously; `status` reports count/capacity + names
+#   9. prometheus /metrics endpoint: scrape the daemon, check families +
+#      backend health, and watch a BPF counter advance across two scrapes
 #
 # Requires: root (CAP_BPF/CAP_NET_ADMIN), kernel >= 5.2 (BTF + netlink
 # clsact attach), python3, and a mounted bpffs at /sys/fs/bpf (pins).
@@ -536,6 +538,100 @@ for i in "${!SCALE_COUNTERS[@]}"; do
 	check "scale backend ${SCALE_PORTS[i]} saw nothing (counter flat)" \
 		test "$(cnt "${SCALE_COUNTERS[i]}")" -eq "${SCA[i]}"
 done
+stop_daemon
+
+# ---------------------------------------------------------------------------
+echo
+echo "== 9. prometheus /metrics endpoint"
+# The daemon hosts /metrics on loopback (same-host scrape: no firewall in
+# the way). Probe a few candidates so a busy box does not trip the scenario.
+METRIC_PORT=""
+for p in 19102 19103 19104; do
+	if python3 -c '
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", '"$p"'))
+s.close()
+'; then
+		METRIC_PORT=$p
+		break
+	fi
+done
+[ -n "$METRIC_PORT" ] || {
+	echo "e2e: no free loopback port for the metrics endpoint" >&2
+	exit 1
+}
+echo "e2e: metrics on 127.0.0.1:$METRIC_PORT"
+
+{
+	echo '[bpf]'
+	echo "pin_dir = \"$PINS\""
+	echo '[defaults]'
+	echo 'ttl_secs = 30'
+	echo 'interval_secs = 2'
+	echo 'timeout_ms = 1000'
+	echo '[metrics]'
+	echo "listen = \"127.0.0.1:$METRIC_PORT\""
+	for port in "${SCALE_PORTS[@]}"; do
+		echo "[[server]]"
+		echo "ip = \"$IP_H\""
+		echo "port = $port"
+	done
+} >"$SCRATCH/daemon-metrics.toml"
+"$BIN" serve --config "$SCRATCH/daemon-metrics.toml" >"$SCRATCH/daemon-metrics.log" 2>&1 &
+DAEMON_PID=$!
+wait_warm 8 "$SCRATCH/daemon-metrics.log"
+
+scrape() {
+	python3 -c '
+import sys, urllib.request
+with open(sys.argv[1], "wb") as f:
+    f.write(urllib.request.urlopen(
+        "http://127.0.0.1:" + sys.argv[2] + "/metrics", timeout=5).read())
+' "$1" "$METRIC_PORT"
+}
+# Extract the value of a metric line (exact match on the whole metric
+# token, so # HELP/# TYPE lines for the same name never match).
+metric() {
+	awk -v m="$1" '$1 == m {print $2; exit}' "$2" 2>/dev/null
+}
+
+# Wait for the endpoint (it starts with the daemon, before the entries).
+for i in $(seq 1 30); do
+	if scrape "$SCRATCH/m0"; then
+		break
+	fi
+	sleep 0.5
+done
+check "metrics: endpoint came up" test -s "$SCRATCH/m0"
+scrape "$SCRATCH/m1"
+
+check "metrics: BPF event family with HELP/TYPE headers" \
+	grep -q "# TYPE a2scache_bpf_events_total counter" "$SCRATCH/m1"
+check "metrics: all 18 BPF event series present" \
+	test "$(grep -c '^a2scache_bpf_events_total{' "$SCRATCH/m1")" -eq 18
+check "metrics: cache capacity is the compile-time 4096" \
+	test "$(metric 'a2scache_cache_capacity' "$SCRATCH/m1")" = "4096"
+check "metrics: the 8 scale instances are cached (>= 8 entries)" \
+	test "$(metric 'a2scache_cache_entries' "$SCRATCH/m1")" -ge 8
+check "metrics: bpf_attached reports the readable maps" \
+	test "$(metric 'a2scache_bpf_attached' "$SCRATCH/m1")" -eq 1
+check "metrics: warmed backend reports up" \
+	grep -q "a2scache_backend_up{ip=\"$IP_H\",port=\"${SCALE_PORTS[0]}\"} 1" \
+	"$SCRATCH/m1"
+check "metrics: per-entry gauges present for a warmed instance" \
+	grep -q "a2scache_entry_info_age_seconds{ip=\"$IP_H\",port=\"${SCALE_PORTS[0]}\"}" \
+	"$SCRATCH/m1"
+check "metrics: build info carries the version" \
+	grep -q 'a2scache_build_info{version="[0-9.]*"} 1' "$SCRATCH/m1"
+
+S1=$(metric 'a2scache_bpf_events_total{stat="served_info"}' "$SCRATCH/m1")
+check_client "metrics: INFO query served from cache" \
+	info "$IP_H:${SCALE_PORTS[0]}" --expect-name "Scale${NAMES[0]}"
+scrape "$SCRATCH/m2"
+S2=$(metric 'a2scache_bpf_events_total{stat="served_info"}' "$SCRATCH/m2")
+check "metrics: served_info counter advanced by exactly one cache hit" \
+	test "$S2" -eq $((S1 + 1))
 stop_daemon
 
 # ---------------------------------------------------------------------------

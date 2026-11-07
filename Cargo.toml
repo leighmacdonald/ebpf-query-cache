@@ -15,6 +15,11 @@ license = "MIT"
 a2s-protocol = { path = "crates/a2s-protocol" }
 aya = "0.14.0"
 aya-ebpf = "0.2.1"
+# Prometheus exposition over tiny-http (sync, no runtime). Default features
+# off: no `internal_metrics` (needs a global registry + lazy_static); keep
+# `logging` so the crate logs through the daemon's existing `log`/
+# env_logger setup.
+prometheus_exporter = { version = "0.8.5", default-features = false, features = ["logging"] }
 
 # Vendored aya-obj with relocation fixes (see vendor/aya-obj/README...).
 # Version must stay in sync with what aya 0.14 requires (^0.3).

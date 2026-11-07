@@ -153,6 +153,10 @@ per_ip_refill_per_s = 2000
 global_capacity = 200000   # token bucket: all sources combined
 global_refill_per_s = 50000
 
+# [metrics]
+# listen = "127.0.0.1:9103"   # Prometheus /metrics endpoint (off unless set;
+                              # `serve --metrics-listen ADDR` wins)
+
 [[server]]
 ip = "192.0.2.10"      # the (ip, port) clients query — the BPF cache key
 port = 27015
@@ -242,6 +246,75 @@ payload ages are `null`):
 ```json
 {"capacity": 4096, "entries": [{"ip": "1.2.3.4", "port": 27015, "name": "Uncletopia | Example", "challenge": 12345, "challenge_age_s": 2, "info_len": 140, "info_age_s": 1, "player_len": 90, "player_age_s": 1, "ttl_s": 30}], "count": 1}
 ```
+
+## Metrics
+
+The daemon can serve Prometheus metrics at `/metrics`. The endpoint is
+**off unless enabled** — set `[metrics] listen` in the config, or pass
+`a2scache serve --metrics-listen 127.0.0.1:9103` (the flag wins). Values
+are re-read from the pinned BPF maps on *every scrape* (never on a
+timer), so an idle daemon does no work; a bind failure logs a warning
+and the daemon runs without metrics.
+
+| metric | type | meaning |
+| --- | --- | --- |
+| `a2scache_bpf_events_total{stat}` | counter | the 18 `stats` verdict counters (`pass_through`, `served_info`, …), per-CPU aggregated; reset to zero when the program is re-attached (the exporter detects the drop and re-baselines) |
+| `a2scache_bpf_attached` | gauge | `1` if the pinned maps were readable on the last scrape |
+| `a2scache_cache_entries` / `a2scache_cache_capacity` | gauge | instances cached vs. the compile-time 4096 |
+| `a2scache_entry_{info,player,challenge}_age_seconds{ip,port}` | gauge | seconds since that half of the entry was last refreshed (`0` = never refreshed, or < 1 s) |
+| `a2scache_entry_{info,player}_bytes{ip,port}` | gauge | cached payload sizes (`0` = never refreshed) |
+| `a2scache_entry_ttl_seconds{ip,port}` | gauge | effective per-instance freshness window recorded in the entry |
+| `a2scache_backend_up{ip,port}` | gauge | `1` if the daemon's last refresh of that backend succeeded |
+| `a2scache_backend_refreshes_total{ip,port,result}` | counter | refresh cycles; `result` = `success`\|`failure` |
+| `a2scache_backend_last_success_seconds{ip,port}` | gauge | Unix time of the last successful refresh (`0` = never) |
+| `a2scache_backend_last_refresh_latency_seconds{ip,port}` | gauge | wall time of the last completed refresh cycle |
+| `a2scache_daemon_uptime_seconds` / `a2scache_daemon_backends` | gauge | daemon wall time / configured `[[server]]` count |
+| `a2scache_build_info{version}` | gauge | always `1`, labelled with the daemon version |
+
+Sample (excerpt):
+
+```text
+a2scache_bpf_events_total{stat="served_info"} 1842
+a2scache_bpf_events_total{stat="pass_through"} 7
+a2scache_cache_entries 10
+a2scache_cache_capacity 4096
+a2scache_entry_info_age_seconds{ip="192.0.2.10",port="27015"} 3
+a2scache_backend_up{ip="192.0.2.10",port="27015"} 1
+a2scache_bpf_attached 1
+```
+
+Scrape config and example alerts:
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: a2scache
+    static_configs:
+      - targets: ["game-cache-host:9103"]
+```
+
+```yaml
+# alerts
+groups:
+  - name: a2scache
+    rules:
+      - alert: A2SCacheBackendDown
+        # the daemon cannot keep this backend warm
+        expr: a2scache_backend_up == 0
+        for: 2m
+      - alert: A2SCacheEntryStale
+        # an entry drifted past its own TTL (refresh slower than TTL)
+        expr: a2scache_entry_info_age_seconds > a2scache_entry_ttl_seconds
+      - alert: A2SCacheBpfDetached
+        # the program fell off the interface (or the pins moved)
+        expr: a2scache_bpf_attached == 0
+        for: 1m
+```
+
+Note: because the BPF stats map is re-created on every `attach`, the
+`a2scache_bpf_events_total` series legitimately restart from a low value
+after a re-attach; the exporter resets the Prometheus counter at that
+point (Prometheus itself handles counter resets for `rate()`/`increase()`).
 
 ## Kernel compatibility
 

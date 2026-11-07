@@ -454,6 +454,24 @@ pub fn status(pin_dir: &Path, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Snapshot of `CACHE_MAP`: `(key, entry)` per cached instance, in map
+/// iteration order (callers that need a stable order sort).
+pub fn cache_entries(pin_dir: &Path) -> Result<Vec<(u64, CacheEntry)>> {
+    let data = MapData::from_pin(pin_path(pin_dir, MAP_CACHE)).map_err(|e| {
+        Error::Bad(format!(
+            "cannot open {}: {e} (is the program attached? run `a2scache attach <iface>`)",
+            pin_path(pin_dir, MAP_CACHE).display()
+        ))
+    })?;
+    let cache: HashMap<MapData, u64, CacheEntry> = Map::from_map_data(data)?.try_into()?;
+    let mut out = Vec::new();
+    for kv in cache.iter() {
+        let (key, entry) = kv?;
+        out.push((key, entry));
+    }
+    Ok(out)
+}
+
 pub fn stats(pin_dir: &Path) -> Result<Vec<u64>> {
     let data = MapData::from_pin(pin_path(pin_dir, MAP_STATS)).map_err(|e| {
         Error::Bad(format!(
