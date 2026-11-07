@@ -43,8 +43,10 @@ test-e2e: build-local
   bash tests/e2e/run.sh
 
 # End-to-end test against real TF2 servers (requires root + running srcds)
-test-e2e-real port1="27015" port2="27025":
-  bash tests/e2e/real_server.sh {{port1}} {{port2}}
+# addr = bare port (backend at the harness veth IP) or ip:port for a
+# backend bound to another of the host's addresses.
+test-e2e-real addr1="27015" addr2="27025":
+  bash tests/e2e/real_server.sh {{addr1}} {{addr2}}
 
 # Install binary, systemd units and example config.
 # Enable with: systemctl enable --now a2scache-attach@<iface> a2scache-daemon

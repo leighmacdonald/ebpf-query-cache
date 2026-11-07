@@ -41,7 +41,11 @@ enum Cmd {
         iface: String,
     },
     /// Show config and cache entries
-    Status,
+    Status {
+        /// Output JSON instead of a table (entry list, machine-readable)
+        #[arg(long)]
+        json: bool,
+    },
     /// Show verdict counters (percpu-aggregated)
     Stats {
         /// Watch mode: refresh interval in seconds
@@ -79,7 +83,7 @@ fn main() -> ExitCode {
         }
         Cmd::Detach { iface } => bpf::detach(iface),
         Cmd::Clean { iface } => bpf::clean(iface, &cli.pin_dir),
-        Cmd::Status => bpf::status(&cli.pin_dir),
+        Cmd::Status { json } => bpf::status(&cli.pin_dir, *json),
         Cmd::Stats { watch, json } => stats_loop(&cli.pin_dir, *watch, *json),
         Cmd::Query {
             addr,

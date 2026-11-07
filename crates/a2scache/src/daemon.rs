@@ -12,6 +12,7 @@
 //! daemon tolerates re-challenges (challenge rotation mid-cycle) and reports
 //! which challenge the final payload was fetched with.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
@@ -21,9 +22,9 @@ use std::thread;
 use std::time::Duration;
 
 use a2s_protocol::{
-    build_info_request, build_info_request_challenged, build_player_request, cache_key,
-    is_fragment, response_type, CacheEntry, Config, Reassembler, MAX_PAYLOAD, NO_CHALLENGE,
-    TYPE_CHALLENGE, TYPE_INFO_RESP, TYPE_PLAYER_RESP,
+    CACHE_MAX_ENTRIES, CacheEntry, Config, MAX_PAYLOAD, NO_CHALLENGE, Reassembler, TYPE_CHALLENGE,
+    TYPE_INFO_RESP, TYPE_PLAYER_RESP, build_info_request, build_info_request_challenged,
+    build_player_request, cache_key, is_fragment, response_type,
 };
 use aya::maps::{Array, HashMap, Map, MapData};
 use serde::Deserialize;
@@ -133,6 +134,11 @@ impl Default for BpfSection {
 }
 
 /// One cached game server.
+///
+/// Every setting has an optional per-instance override that falls back to
+/// `[defaults]`, so an instance can carry its own freshness window and
+/// refresh cadence (e.g. a low-population instance refreshed slowly) without
+/// tuning the whole daemon.
 #[derive(Clone, Debug, Deserialize)]
 pub struct ServerSection {
     /// Backend IPv4 address (the BPF program only handles IPv4).
@@ -142,6 +148,14 @@ pub struct ServerSection {
     /// Optional source MAC for synthesized replies; overrides the MAC
     /// recorded by `attach` when set (first server wins, see [`serve`]).
     pub mac: Option<String>,
+    /// Per-instance TTL override (seconds; falls back to `[defaults]`).
+    pub ttl_secs: Option<u64>,
+    /// Per-instance refresh period override (seconds; falls back to
+    /// `[defaults]`).
+    pub interval_secs: Option<u64>,
+    /// Per-instance per-datagram receive timeout override (milliseconds;
+    /// falls back to `[defaults]`).
+    pub timeout_ms: Option<u64>,
 }
 
 /// A validated backend: the per-thread refresh target.
@@ -152,12 +166,37 @@ pub struct Backend {
     pub mac: Option<[u8; 6]>,
     /// `ip:port` label used in log lines.
     pub label: String,
+    /// Effective freshness window in nanoseconds (per-instance override or
+    /// `[defaults]`); written into every BPF cache entry on refresh.
+    pub ttl_ns: u64,
+    /// Effective per-instance refresh period.
+    pub interval: Duration,
+    /// Effective per-instance per-datagram receive timeout.
+    pub timeout: Duration,
 }
 
 impl Backend {
     pub fn addr(&self) -> SocketAddrV4 {
         SocketAddrV4::new(self.ip, self.port)
     }
+}
+
+/// Resolve the per-instance overrides of one `[[server]]` against
+/// `[defaults]`, enforcing the same floors as the global values.
+fn effective(d: &DefaultsSection, s: &ServerSection, label: &str) -> Result<(u64, u64, u64)> {
+    let ttl_secs = s.ttl_secs.unwrap_or(d.ttl_secs);
+    let interval_secs = s.interval_secs.unwrap_or(d.interval_secs);
+    let timeout_ms = s.timeout_ms.unwrap_or(d.timeout_ms);
+    if ttl_secs == 0 {
+        return Err(Error::Bad(format!("[{label}] ttl_secs must be >= 1")));
+    }
+    if interval_secs == 0 {
+        return Err(Error::Bad(format!("[{label}] interval_secs must be >= 1")));
+    }
+    if timeout_ms < 100 {
+        return Err(Error::Bad(format!("[{label}] timeout_ms must be >= 100")));
+    }
+    Ok((ttl_secs, interval_secs, timeout_ms))
 }
 
 /// Read and validate the daemon config file.
@@ -186,6 +225,7 @@ pub fn load_config(path: &Path) -> Result<(FileConfig, Vec<Backend>)> {
         let ip: Ipv4Addr =
             s.ip.parse()
                 .map_err(|_| Error::Bad(format!("bad server ip `{}` (want IPv4)", s.ip)))?;
+        let label = format!("{}:{}", s.ip, s.port);
         let mac = s
             .mac
             .as_deref()
@@ -193,20 +233,54 @@ pub fn load_config(path: &Path) -> Result<(FileConfig, Vec<Backend>)> {
             .transpose()
             .map_err(|_| {
                 Error::Bad(format!(
-                    "bad mac `{}` for server {}:{}",
+                    "bad mac `{}` for server {}",
                     s.mac.as_deref().unwrap_or(""),
-                    s.ip,
-                    s.port
+                    label
                 ))
             })?;
+        let (ttl_secs, interval_secs, timeout_ms) = effective(&cfg.defaults, s, &label)?;
         backends.push(Backend {
             ip,
             port: s.port,
             mac,
-            label: format!("{}:{}", s.ip, s.port),
+            label,
+            ttl_ns: ttl_secs.saturating_mul(1_000_000_000),
+            interval: Duration::from_secs(interval_secs),
+            timeout: Duration::from_millis(timeout_ms),
         });
     }
+    validate_backends(&backends, CACHE_MAX_ENTRIES)?;
     Ok((cfg, backends))
+}
+
+/// Fail fast on a config that cannot be honoured: duplicate `(ip, port)`
+/// pairs (each maps to the same BPF cache key, so at least one entry is
+/// redundant) or more instances than the BPF cache map can ever hold
+/// (`CACHE_MAX_ENTRIES` is a compile-time map parameter).
+pub fn validate_backends(backends: &[Backend], capacity: u32) -> Result<()> {
+    let mut seen = HashSet::<(u32, u16)>::new();
+    let mut dups = Vec::<String>::new();
+    for b in backends {
+        if !seen.insert((u32::from(b.ip), b.port)) {
+            dups.push(b.label.clone());
+        }
+    }
+    if !dups.is_empty() {
+        return Err(Error::Bad(format!(
+            "duplicate [[server]] (ip, port): {}; every instance needs a unique key",
+            dups.join(", ")
+        )));
+    }
+    if backends.len() > capacity as usize {
+        return Err(Error::Bad(format!(
+            "{} instances configured, but the BPF cache map holds at most {} \
+             (a2s_protocol::CACHE_MAX_ENTRIES); trim [[server]] entries or \
+             rebuild with a larger capacity",
+            backends.len(),
+            capacity
+        )));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -371,8 +445,10 @@ pub fn refresh_once(sock: &UdpSocket, target: SocketAddrV4, label: &str) -> Resu
 
 /// Merge a refresh into the previous entry. Successful halves replace the
 /// cached bytes (tails zeroed — BPF checksums the payload view rounded up to
-/// a 4-byte multiple); failed halves keep their old bytes.
-pub fn merge_entry(old: &CacheEntry, data: &RefreshData, now: u64) -> CacheEntry {
+/// a 4-byte multiple); failed halves keep their old bytes. `ttl_ns` is the
+/// per-instance freshness window (BPF falls back to the global TTL when an
+/// entry has never been refreshed and still carries 0).
+pub fn merge_entry(old: &CacheEntry, data: &RefreshData, now: u64, ttl_ns: u64) -> CacheEntry {
     let mut e = *old;
     if let Some(ch) = data.challenge {
         e.challenge = ch;
@@ -390,6 +466,7 @@ pub fn merge_entry(old: &CacheEntry, data: &RefreshData, now: u64) -> CacheEntry
         e.player_len = player.len() as u16;
         e.ts_player = now;
     }
+    e.ttl_ns = ttl_ns;
     e
 }
 
@@ -534,15 +611,17 @@ fn spawn_signal_thread() -> thread::JoinHandle<()> {
 }
 
 /// Refresh loop for one backend. Reopens the cache map on failure so a single
-/// wedged backend (or map hiccup) never kills the daemon.
-fn backend_loop(pin_dir: PathBuf, backend: Backend, d: DefaultsSection) {
+/// wedged backend (or map hiccup) never kills the daemon. The per-instance
+/// TTL/interval/timeout come from `backend`, not the global defaults.
+fn backend_loop(pin_dir: PathBuf, backend: Backend) {
     let key = cache_key(u32::from(backend.ip), backend.port);
-    let timeout = Duration::from_millis(d.timeout_ms);
-    let interval = Duration::from_secs(d.interval_secs);
+    let timeout = backend.timeout;
+    let interval = backend.interval;
     log::info!(
-        "[{}] watching (interval {}s)",
+        "[{}] watching (ttl {}s, interval {}s)",
         backend.label,
-        d.interval_secs
+        backend.ttl_ns / 1_000_000_000,
+        interval.as_secs()
     );
 
     loop {
@@ -572,7 +651,7 @@ fn backend_loop(pin_dir: PathBuf, backend: Backend, d: DefaultsSection) {
             }
             let now = bpf::now_ns()?;
             let old = cache.get(&key, 0).unwrap_or_default();
-            let entry = merge_entry(&old, &data, now);
+            let entry = merge_entry(&old, &data, now, backend.ttl_ns);
             cache.insert(key, entry, 0)?;
             log::info!(
                 "[{}] refreshed: challenge {} info={}B player={}B",
@@ -587,7 +666,7 @@ fn backend_loop(pin_dir: PathBuf, backend: Backend, d: DefaultsSection) {
             log::warn!(
                 "[{}] refresh failed ({e}); retrying in {}s",
                 backend.label,
-                d.interval_secs
+                interval.as_secs()
             );
         }
 
@@ -625,8 +704,7 @@ pub fn serve(config_path: &Path, pin_dir_override: Option<&Path>) -> Result<()> 
     let mut handles = Vec::with_capacity(backends.len());
     for b in backends {
         let pin_dir = pin_dir.clone();
-        let d = cfg.defaults;
-        handles.push(thread::spawn(move || backend_loop(pin_dir, b, d)));
+        handles.push(thread::spawn(move || backend_loop(pin_dir, b)));
     }
 
     // Park the main thread until a signal arrives; the waiter sets SHUTDOWN
@@ -678,6 +756,10 @@ port = 27015
         assert_eq!(backends[0].ip, Ipv4Addr::new(10, 0, 0, 1));
         assert_eq!(backends[0].port, 27015);
         assert_eq!(backends[0].mac, None);
+        // `[defaults]` fallbacks applied to the instance.
+        assert_eq!(backends[0].ttl_ns, 30 * 1_000_000_000);
+        assert_eq!(backends[0].interval, Duration::from_secs(10));
+        assert_eq!(backends[0].timeout, Duration::from_millis(2000));
         assert_eq!(cfg.bpf.pin_dir, PathBuf::from(bpf::DEFAULT_PIN_DIR));
         let d = cfg.defaults;
         assert_eq!(d.ttl_secs, 30);
@@ -687,6 +769,74 @@ port = 27015
         assert_eq!(d.per_ip_refill_per_s, 2_000);
         assert_eq!(d.global_capacity, 200_000);
         assert_eq!(d.global_refill_per_s, 50_000);
+    }
+
+    #[test]
+    fn per_instance_overrides_apply() {
+        let (cfg, backends) = load_str(
+            r#"
+[[server]]
+ip = "10.0.0.1"
+port = 27015
+
+[[server]]
+ip = "10.0.0.1"
+port = 27016
+ttl_secs = 5
+interval_secs = 15
+timeout_ms = 900
+"#,
+        )
+        .unwrap();
+        assert_eq!(backends[0].ttl_ns, 30 * 1_000_000_000); // default
+        assert_eq!(backends[0].interval, Duration::from_secs(10));
+        assert_eq!(backends[0].timeout, Duration::from_millis(2000));
+        assert_eq!(backends[1].ttl_ns, 5 * 1_000_000_000); // overridden
+        assert_eq!(backends[1].interval, Duration::from_secs(15));
+        assert_eq!(backends[1].timeout, Duration::from_millis(900));
+        assert_eq!(cfg.defaults.interval_secs, 10);
+    }
+
+    #[test]
+    fn per_instance_overrides_respect_floors() {
+        for raw in [
+            "[[server]]\nip = \"10.0.0.1\"\nport = 27015\nttl_secs = 0\n",
+            "[[server]]\nip = \"10.0.0.1\"\nport = 27015\ninterval_secs = 0\n",
+            "[[server]]\nip = \"10.0.0.1\"\nport = 27015\ntimeout_ms = 50\n",
+        ] {
+            assert!(
+                load_str(raw).is_err(),
+                "accepted per-instance override below the floor: {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_keys_and_overfull_config() {
+        // Direct unit test of validate_backends with a tiny capacity, since
+        // CACHE_MAX_ENTRIES itself is far too high to fill in a test.
+        let backend = |ip: u32, port: u16| Backend {
+            ip: Ipv4Addr::from(ip),
+            port,
+            mac: None,
+            label: format!("{}:{port}", Ipv4Addr::from(ip)),
+            ttl_ns: 1_000_000_000,
+            interval: Duration::from_secs(1),
+            timeout: Duration::from_millis(100),
+        };
+        validate_backends(&[backend(1, 1)], 2).unwrap();
+        validate_backends(&[backend(1, 1), backend(1, 2)], 2).unwrap();
+
+        let dup = backend(1, 1);
+        let err = validate_backends(&[dup.clone(), dup], 8).unwrap_err();
+        assert!(err.to_string().contains("duplicate [[server]]"), "{err}");
+
+        let over = [backend(1, 1), backend(1, 2), backend(1, 3)];
+        let err = validate_backends(&over, 2).unwrap_err();
+        assert!(
+            err.to_string().contains("cache map holds at most 2"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -760,6 +910,9 @@ port = 27016
             port: 27015,
             mac: None,
             label: "x".into(),
+            ttl_ns: 30 * 1_000_000_000,
+            interval: Duration::from_secs(10),
+            timeout: Duration::from_millis(2000),
         };
         (cache_key(u32::from(b.ip), b.port), b.addr())
     }

@@ -18,6 +18,19 @@
 /// cached and always pass through to the backend.
 pub const MAX_PAYLOAD: usize = 2048;
 
+/// Capacity of the BPF cache map: the maximum number of game instances
+/// (`CACHE_MAP` entries) that can be served concurrently.
+///
+/// `max_entries` is a compile-time BPF map parameter (aya creates the map from
+/// the loaded ELF), so it cannot be tuned per deployment at attach time. 4096
+/// entries keep the map at ~17 MiB of values (4096 × ~4.1 KB), comfortably
+/// within BPF memory limits on the supported kernels while leaving a lot of
+/// headroom for instances added over time. The daemon validates the
+/// `[[server]]` count against this at config-load time, so an over-full
+/// config fails fast with a clear message instead of silently dropping
+/// refreshes.
+pub const CACHE_MAX_ENTRIES: u32 = 4096;
+
 pub const MAGIC: [u8; 4] = [0xFF, 0xFF, 0xFF, 0xFF];
 
 /// Value of the 4-byte LE header of a split-fragment datagram (-2).
@@ -134,6 +147,23 @@ pub fn build_challenge_response(buf: &mut [u8], challenge: u32) -> Result<usize,
     Ok(CHALLENGE_RESP_LEN)
 }
 
+/// The server name carried by an A2S_INFO response (`info\0` after the
+/// header and the protocol byte).
+///
+/// `payload` is the cached response datagram, `FF FF FF FF 49 protocol:1
+/// name\0 map\0 ...`. Returns `None` when the payload is not a well-formed
+/// INFO response or the name is not valid UTF-8 (Source server names are
+/// normally ASCII/UTF-8; a non-decodable name is displayed as unknown rather
+/// than guessing at an encoding).
+pub fn info_banner_name(payload: &[u8]) -> Option<&str> {
+    if payload.len() < 7 || payload[0..4] != MAGIC || payload[4] != TYPE_INFO_RESP {
+        return None;
+    }
+    let rest = &payload[6..];
+    let end = rest.iter().position(|&b| b == 0)?;
+    core::str::from_utf8(&rest[..end]).ok()
+}
+
 /// Reassembles a split (FE FF FF FF) response into one datagram.
 ///
 /// Fragments must arrive in `number` order, which holds for a single UDP
@@ -242,6 +272,14 @@ pub struct RateEntry {
 
 /// Per-backend cache entry. Timestamps are `bpf_ktime_get_ns()`
 /// (= `CLOCK_MONOTONIC`) nanoseconds.
+///
+/// `ttl_ns` is the *per-instance* freshness window, written by the daemon
+/// from the `[[server]]` override (or the `[defaults]` fallback). It sits at
+/// the end of the entry so the `info`/`player` offsets are unchanged: the
+/// BPF verifier's existing bounds reasoning about those fixed-offset payload
+/// regions simply gains slack (map value 4152 B > 4144 B before).
+/// `ttl_ns == 0` (entry not yet refreshed, or legacy entry) means "use the
+/// global `Config.ttl_ns`".
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CacheEntry {
@@ -255,6 +293,7 @@ pub struct CacheEntry {
     pub ts_player: u64,
     pub info: [u8; MAX_PAYLOAD],
     pub player: [u8; MAX_PAYLOAD],
+    pub ttl_ns: u64,
 }
 
 impl Default for CacheEntry {
@@ -270,6 +309,7 @@ impl Default for CacheEntry {
             ts_player: 0,
             info: [0; MAX_PAYLOAD],
             player: [0; MAX_PAYLOAD],
+            ttl_ns: 0,
         }
     }
 }
@@ -352,7 +392,8 @@ pub mod stats {
 const _: () = {
     assert!(core::mem::size_of::<RateEntry>() == 16);
     assert!(core::mem::align_of::<RateEntry>() == 8);
-    assert!(core::mem::size_of::<CacheEntry>() == 48 + 2 * MAX_PAYLOAD);
+    // 48-byte header + two payload buffers + trailing per-instance ttl_ns.
+    assert!(core::mem::size_of::<CacheEntry>() == 48 + 2 * MAX_PAYLOAD + 8);
     assert!(core::mem::align_of::<CacheEntry>() == 8);
     assert!(core::mem::size_of::<Config>() == 48);
     assert!(core::mem::align_of::<Config>() == 8);
@@ -554,6 +595,57 @@ mod tests {
         assert_eq!(offset_of!(CacheEntry, ts_player), 40);
         assert_eq!(offset_of!(CacheEntry, info), 48);
         assert_eq!(offset_of!(CacheEntry, player), 48 + MAX_PAYLOAD);
+        // ttl_ns trails the payloads so info/player offsets stay put (see the
+        // CacheEntry docs): the BPF verifier's bounds reasoning about those
+        // regions is unchanged.
+        assert_eq!(offset_of!(CacheEntry, ttl_ns), 48 + 2 * MAX_PAYLOAD);
         assert_eq!(offset_of!(Config, backend_mac), 40);
+        assert_eq!(CACHE_MAX_ENTRIES, 4096);
+    }
+
+    #[test]
+    fn cache_max_entries_bounds_map_size() {
+        // Guard headline memory use: 4096 entries must stay well under the
+        // BPF map limits on the supported kernels (~17 MiB of values).
+        let value_bytes = core::mem::size_of::<CacheEntry>();
+        assert_eq!(
+            value_bytes as u64 * u64::from(CACHE_MAX_ENTRIES),
+            4152 * 4096
+        );
+    }
+
+    #[test]
+    fn banner_name_extracts_first_cstring() {
+        // FF FF FF FF 49 proto name\0 map\0 ...
+        let mut p = vec![0xFF, 0xFF, 0xFF, 0xFF, 0x49, 0x02];
+        p.extend(b"Uncletopia | TST\0tf\0");
+        assert_eq!(info_banner_name(&p), Some("Uncletopia | TST"));
+    }
+
+    #[test]
+    fn banner_name_rejects_malformed() {
+        // Empty name string is still a valid (empty) name.
+        let mut p = vec![0xFF, 0xFF, 0xFF, 0xFF, 0x49, 0x02];
+        p.extend(b"\0tf\0");
+        assert_eq!(info_banner_name(&p), Some(""));
+
+        // Not an INFO response type.
+        let players = vec![0xFF, 0xFF, 0xFF, 0xFF, 0x44, 0x01, b'a', 0];
+        assert_eq!(info_banner_name(&players), None);
+        // Bad magic.
+        let bad_magic = vec![0xFF, 0xFF, 0xFF, 0xFE, 0x49, 0x02, b'a', 0];
+        assert_eq!(info_banner_name(&bad_magic), None);
+        // Too short to hold magic + type + protocol byte.
+        assert_eq!(info_banner_name(&[0xFF, 0xFF, 0xFF, 0xFF]), None);
+        assert_eq!(info_banner_name(&[]), None);
+        // Unterminated name.
+        let open = vec![0xFF, 0xFF, 0xFF, 0xFF, 0x49, 0x02, b'n', b'a', b'm', b'e'];
+        assert_eq!(info_banner_name(&open), None);
+        // Truncated before the protocol byte.
+        let short = vec![0xFF, 0xFF, 0xFF, 0xFF, 0x49];
+        assert_eq!(info_banner_name(&short), None);
+        // Non-UTF-8 name bytes.
+        let non_utf8 = vec![0xFF, 0xFF, 0xFF, 0xFF, 0x49, 0x02, 0xC3, 0x28, 0];
+        assert_eq!(info_banner_name(&non_utf8), None);
     }
 }

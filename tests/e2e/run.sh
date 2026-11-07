@@ -9,6 +9,10 @@
 #   4. stale entry -> pass-through to the real backend
 #   5. backend A down -> B unaffected (daemon keeps B warm, A fails)
 #   6. rate-limit burst -> drops + stats (shared per-source-IP bucket)
+#   7. per-instance TTL: a short-ttl instance goes stale (pass-through) while
+#      a long-ttl instance stays fresh (served from cache)
+#   8. scale: N game instances (fake backends) cached, isolated, and served
+#      from cache simultaneously; `status` reports count/capacity + names
 #
 # Requires: root (CAP_BPF/CAP_NET_ADMIN), kernel >= 5.2 (BTF + netlink
 # clsact attach), python3, and a mounted bpffs at /sys/fs/bpf (pins).
@@ -79,6 +83,7 @@ cleanup() {
 	[ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null || true
 	[ -n "$FAKE_A_PID" ] && kill "$FAKE_A_PID" 2>/dev/null || true
 	[ -n "$FAKE_B_PID" ] && kill "$FAKE_B_PID" 2>/dev/null || true
+	[ -n "${SCALE_PIDS:-}" ] && kill $SCALE_PIDS 2>/dev/null || true
 	wait 2>/dev/null || true
 	"$BIN" clean "$VH" --pin-dir "$PINS" >/dev/null 2>&1 || true
 	rm -rf "$PINS" 2>/dev/null || true
@@ -135,6 +140,9 @@ print(b[sys.argv[3]] - a[sys.argv[3]])' "$1" "$2" "$3"
 }
 
 cnt() { cat "$1" 2>/dev/null || echo 0; }
+
+# PIDs of the scenario-8 scale fake servers (all killed by `cleanup`).
+SCALE_PIDS=""
 
 echo "e2e: cleaning stale smoke-test state (a2ssmoke netns / veth-h)"
 ip netns del a2ssmoke 2>/dev/null || true
@@ -239,20 +247,21 @@ echo "e2e: starting refresh daemon"
 DAEMON_PID=$!
 
 wait_warm() {
+	local min=${1:-2} log=${2:-"$SCRATCH/daemon.log"}
 	local i out ni np
 	for i in $(seq 1 60); do
 		out=$("$BIN" status --pin-dir "$PINS" 2>/dev/null || true)
 		ni=$(grep -c 'info_len=[1-9]' <<<"$out" || true)
 		np=$(grep -c 'player_len=[1-9]' <<<"$out" || true)
-		if [ "${ni:-0}" -ge 2 ] && [ "${np:-0}" -ge 2 ]; then
-			echo "e2e: cache warmed after ~$((i / 2))s"
+		if [ "${ni:-0}" -ge "$min" ] && [ "${np:-0}" -ge "$min" ]; then
+			echo "e2e: $min instance(s) warmed after ~$((i / 2))s"
 			return 0
 		fi
 		sleep 0.5
 	done
-	echo "e2e: cache never warmed"
+	echo "e2e: only ${ni:-0}/${min} instances warmed (need $min with INFO + PLAYER)"
 	"$BIN" status --pin-dir "$PINS" || true
-	tail -20 "$SCRATCH/daemon.log"
+	tail -20 "$log"
 	return 1
 }
 wait_warm
@@ -340,6 +349,194 @@ UK=$(delta "$SCRATCH/s7" "$SCRATCH/s8" unknown_key)
 check "burst seen by classifier (unknown_key == 25)" test "$UK" -eq 25
 check "burst dropped at rate limit (>= 15 drops)" test "$DRIP" -ge 15
 check "burst limited pass-through (<= 10)" test "$PT" -le 10
+
+# ---------------------------------------------------------------------------
+echo
+echo "== 7. per-instance TTL (A short, B long)"
+# Scenario 5 killed fake A; scenario 6's burst drained the per-IP
+# pass-through bucket. Restart A and give the config a roomy pass-through
+# budget so this scenario measures cache-vs-staleness, not rate limiting.
+python3 "$SCRIPT_DIR/fake_server.py" --bind "$IP_H" --port "$PORT_A" \
+	--name FakeServerAlpha --players 2 --player-prefix Alpha \
+	--counter "$SCRATCH/counter-a7" >"$SCRATCH/fake-a2.log" 2>&1 &
+FAKE_A_PID=$!
+sleep 0.3
+kill -0 "$FAKE_A_PID" 2>/dev/null
+cat >"$SCRATCH/daemon-ttl.toml" <<EOF
+[bpf]
+pin_dir = "$PINS"
+
+[defaults]
+ttl_secs = 30
+interval_secs = 1
+timeout_ms = 1000
+# Big pass-through bucket: the stale-A dance below must not be blocked by
+# scenario 6's leftover token drain (and scenario 8 probes inherit this).
+per_ip_capacity = 100000
+per_ip_refill_per_s = 5000
+
+[[server]]
+ip = "$IP_H"
+port = $PORT_A
+ttl_secs = 2
+
+[[server]]
+ip = "$IP_H"
+port = $PORT_B
+ttl_secs = 30
+EOF
+"$BIN" serve --config "$SCRATCH/daemon-ttl.toml" >"$SCRATCH/daemon-ttl.log" 2>&1 &
+DAEMON_PID=$!
+wait_warm 2 "$SCRATCH/daemon-ttl.log"
+# wait_warm exits as soon as entries exist; A/B may still carry the old
+# 30s TTL from the earlier scenarios, so wait for A's first refresh with
+# the per-instance TTL actually landing in the entry.
+for i in $(seq 1 40); do
+	if "$BIN" status --pin-dir "$PINS" 2>/dev/null | grep -q ":$PORT_A  .*ttl=2s"; then
+		break
+	fi
+	sleep 0.5
+done
+"$BIN" status --pin-dir "$PINS" >"$SCRATCH/status-ttl.txt"
+check "A entry carries its per-instance TTL (2s)" \
+	grep -q ":$PORT_A  .*ttl=2s" "$SCRATCH/status-ttl.txt"
+check "B entry carries its per-instance TTL (30s)" \
+	grep -q ":$PORT_B  .*ttl=30s" "$SCRATCH/status-ttl.txt"
+stop_daemon
+sleep 3
+CA=$(cnt "$SCRATCH/counter-a7")
+CB=$(cnt "$SCRATCH/counter-b")
+snap_stats "$SCRATCH/s9"
+check_client "stale A (ttl 2s) passed through to the backend" \
+	info "$IP_H:$PORT_A" --expect-name FakeServerAlpha --players-count 2 --timeout 6
+snap_stats "$SCRATCH/s10"
+check "both stale-A request datagrams passed through" \
+	test "$(delta "$SCRATCH/s9" "$SCRATCH/s10" pass_through)" -eq 2
+check "A answered by the backend (counter +1)" \
+	test "$(cnt "$SCRATCH/counter-a7")" -eq $((CA + 1))
+check_client "fresh B (ttl 30s) still served from cache" \
+	info "$IP_H:$PORT_B" --expect-name FakeServerBeta --players-count 30
+snap_stats "$SCRATCH/s11"
+check "B answered from cache (backend counter flat)" \
+	test "$(cnt "$SCRATCH/counter-b")" -eq "$CB"
+check "B never passed-through while fresh" \
+	test "$(delta "$SCRATCH/s10" "$SCRATCH/s11" pass_through)" -eq 0
+check "at least one B cache hit recorded" \
+	test "$(delta "$SCRATCH/s9" "$SCRATCH/s11" served_info)" -ge 1
+
+# ---------------------------------------------------------------------------
+echo
+echo "== 8. scale: 8 instances cached, isolated, and served from cache"
+sleep 1
+SCALE_PORTS=()
+for port in 27220 27221 27222 27223 27224 27225 27226 27227 \
+	27061 27062 27063 27064 27065 27066 27067 27068; do
+	[ "${#SCALE_PORTS[@]}" -lt 8 ] || break
+	if probe_port "$port"; then SCALE_PORTS+=("$port"); fi
+done
+[ "${#SCALE_PORTS[@]}" -eq 8 ] || {
+	echo "e2e: found only ${#SCALE_PORTS[@]} usable backend ports (need 8)" >&2
+	exit 1
+}
+echo "e2e: scale backend ports ${SCALE_PORTS[*]}"
+NAMES=(Alpha Bravo Charlie Delta Echo Foxtrot Golf Hotel)
+SCALE_PIDS=""
+SCALE_COUNTERS=()
+for i in "${!SCALE_PORTS[@]}"; do
+	port=${SCALE_PORTS[i]}
+	counter="$SCRATCH/counter-s$i"
+	python3 "$SCRIPT_DIR/fake_server.py" --bind "$IP_H" --port "$port" \
+		--name "Scale${NAMES[i]}" --players $((3 + i)) \
+		--player-prefix "S${NAMES[i]}" --counter "$counter" \
+		>"$SCRATCH/fake-s$i.log" 2>&1 &
+	SCALE_PIDS+="$! "
+	SCALE_COUNTERS+=("$counter")
+done
+sleep 0.8
+for pid in $SCALE_PIDS; do
+	if ! kill -0 "$pid" 2>/dev/null; then
+		echo "e2e: scale fake server failed to start"
+		cat "$SCRATCH"/fake-s*.log
+		exit 1
+	fi
+done
+SCALE_PIDS="${SCALE_PIDS% }"
+
+{
+	echo '[bpf]'
+	echo "pin_dir = \"$PINS\""
+	echo '[defaults]'
+	echo 'ttl_secs = 30'
+	echo 'interval_secs = 2'
+	echo 'timeout_ms = 1000'
+	echo 'per_ip_capacity = 100000'
+	echo 'per_ip_refill_per_s = 5000'
+	for port in "${SCALE_PORTS[@]}"; do
+		echo "[[server]]"
+		echo "ip = \"$IP_H\""
+		echo "port = $port"
+	done
+} >"$SCRATCH/daemon-scale.toml"
+"$BIN" serve --config "$SCRATCH/daemon-scale.toml" >"$SCRATCH/daemon-scale.log" 2>&1 &
+DAEMON_PID=$!
+# 10 warmed entries: the 8 scale instances + the still-present A/B entries.
+wait_warm 10 "$SCRATCH/daemon-scale.log"
+# Stop the daemon before the client queries: the fakes' counters must not
+# move while they are watched (scenarios 1-5 use the same pattern).
+stop_daemon
+sleep 0.3
+SCA=()
+for i in "${!SCALE_COUNTERS[@]}"; do
+	SCA+=("$(cnt "${SCALE_COUNTERS[i]}")")
+done
+
+"$BIN" status --pin-dir "$PINS" >"$SCRATCH/status-scale.txt"
+check "status summary shows instance count over the 4096 capacity" \
+	grep -q "cache entries: 10 / 4096" "$SCRATCH/status-scale.txt"
+check "status lists per-instance names" \
+	grep -q "name=ScaleAlpha" "$SCRATCH/status-scale.txt"
+check "status entry carries per-instance TTL" \
+	grep -q "ttl=30s" "$SCRATCH/status-scale.txt"
+
+for i in "${!SCALE_PORTS[@]}"; do
+	port=${SCALE_PORTS[i]}
+	check_client "scale:${port} served from cache as 'Scale${NAMES[i]}'" \
+		info "$IP_H:$port" --expect-name "Scale${NAMES[i]}" \
+		--players-count $((3 + i))
+done
+
+"$BIN" status --json --pin-dir "$PINS" >"$SCRATCH/status.json"
+check "status --json reports all 8 instances with capacity/names" python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["capacity"] == 4096, d
+assert len(d["entries"]) == d["count"] >= 10, d  # 8 scale + backends A/B
+scale = {e["name"] for e in d["entries"] if e["name"].startswith("Scale")}
+want = {"ScaleAlpha", "ScaleBravo", "ScaleCharlie", "ScaleDelta",
+        "ScaleEcho", "ScaleFoxtrot", "ScaleGolf", "ScaleHotel"}
+assert scale == want, scale
+for e in d["entries"]:
+	assert e["ip"].count(".") == 3, e
+	assert e["info_len"] > 0 and e["info_age_s"] is not None, e
+	assert e["ttl_s"] > 0, e
+' "$SCRATCH/status.json"
+
+snap_stats "$SCRATCH/s12"
+for i in "${!SCALE_PORTS[@]}"; do
+	port=${SCALE_PORTS[i]}
+	check_client "scale:${port} repeat INFO still served from cache" \
+		info "$IP_H:$port" --expect-name "Scale${NAMES[i]}" --players-count $((3 + i))
+done
+snap_stats "$SCRATCH/s13"
+check "8 repeat cache hits, zero pass-through" \
+	test "$(delta "$SCRATCH/s12" "$SCRATCH/s13" pass_through)" -eq 0
+check "8 repeat cache hits counted" \
+	test "$(delta "$SCRATCH/s12" "$SCRATCH/s13" served_info)" -eq 8
+for i in "${!SCALE_COUNTERS[@]}"; do
+	check "scale backend ${SCALE_PORTS[i]} saw nothing (counter flat)" \
+		test "$(cnt "${SCALE_COUNTERS[i]}")" -eq "${SCA[i]}"
+done
+stop_daemon
 
 # ---------------------------------------------------------------------------
 echo

@@ -6,12 +6,14 @@
 # the a2scache program is attached on the host-side veth ingress, and the
 # backends are the real srcds instances on this host.
 #
-# The cached address is the attached veth's IP ($IP_H), not another of the
-# host's IPs: srcds binds 0.0.0.0, so a pass-through reply to the netns
-# client leaves via the veth and the kernel sources it with the veth's
-# address — the client must target that address for the dance to complete.
-# (Same reason 127.0.0.1 cannot be a backend: the Source engine ignores
-# A2S with a 127/8 source.)
+# The cached address is what the client targets and what the daemon queries:
+# by default the attached veth's IP ($IP_H) — a wildcard-bound srcds answers
+# there, and a pass-through reply leaves via the veth sourced with its
+# address. A backend that listens on another of the host's addresses (e.g. a
+# tailscale-bound instance: 100.69.69.100:27025) can be used too: pass its
+# explicit ip:port and the (ip, port) cache key follows — pass-through is
+# normal kernel local delivery either way. (Same reason 127.0.0.1 cannot be
+# a backend: the Source engine ignores A2S with a 127/8 source.)
 #
 # Verifies:
 #   1. INFO/PLAYER challenge dances served from cache for two real TF2
@@ -27,13 +29,16 @@
 # Best with idle servers (0 players): player lists that change between
 # queries would make the byte-comparison flaky.
 #
-# Usage: real_server.sh [PORT1 PORT2]   (default 27015 27025)
+# Usage: real_server.sh [ADDR1 [ADDR2]]
+#   ADDR is a bare port (backend at the veth IP) or an explicit ip:port for
+#   a backend listening on another of the host's addresses.
+#   Defaults: 27015 27025 (both at the veth IP).
 # Requires: root, python3, both srcds instances running.
 set -euo pipefail
 export RUST_LOG=${RUST_LOG:-info}
 
-PORT1=${1:-27015}
-PORT2=${2:-27025}
+ADDR1=${1:-27015}
+ADDR2=${2:-27025}
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)
@@ -59,6 +64,26 @@ VT=a2s-t
 IP_H=10.200.1.1
 IP_T=10.200.1.2
 TTL=8
+
+# split_addr "ip:port"|"port" -> sets AIP/APORT (bare port => veth IP).
+split_addr() {
+	local a=$1
+	if [[ $a == *:* ]]; then
+		AIP=${a%:*}
+		APORT=${a##*:}
+	else
+		AIP=$IP_H
+		APORT=$a
+	fi
+}
+split_addr "$ADDR1"
+IP1=$AIP
+PORT1=$APORT
+TGT1=$AIP:$APORT
+split_addr "$ADDR2"
+IP2=$AIP
+PORT2=$APORT
+TGT2=$AIP:$APORT
 
 # BPF_OBJ_PIN requires the parent to be a bpffs mount.
 PINS=/sys/fs/bpf/a2scache-real
@@ -132,12 +157,12 @@ ip netns exec "$NS" ip route add default via "$IP_H"
 ip addr add "$IP_H/24" dev "$VH"
 ip link set "$VH" up
 
-echo "real: baseline direct queries (host -> $IP_H, no BPF)"
-BASE1=$(python3 "$SCRIPT_DIR/client.py" info "$IP_H:$PORT1" \
+echo "real: baseline direct queries (host -> $TGT1, $TGT2, no BPF)"
+BASE1=$(python3 "$SCRIPT_DIR/client.py" info "$TGT1" \
 	--hex-out "$SCRATCH/base1.info" --timeout 5)
-BASEP1=$(python3 "$SCRIPT_DIR/client.py" players "$IP_H:$PORT1" \
+BASEP1=$(python3 "$SCRIPT_DIR/client.py" players "$TGT1" \
 	--hex-out "$SCRATCH/base1.players" --timeout 5)
-BASE2=$(python3 "$SCRIPT_DIR/client.py" info "$IP_H:$PORT2" \
+BASE2=$(python3 "$SCRIPT_DIR/client.py" info "$TGT2" \
 	--hex-out "$SCRATCH/base2.info" --timeout 5)
 echo "  $BASE1"
 echo "  $BASE2"
@@ -148,7 +173,7 @@ NAME2=$(name_of "$BASE2")
 	exit 1
 }
 
-echo "real: attach + daemon (backends $IP_H:$PORT1, $IP_H:$PORT2, ttl ${TTL}s)"
+echo "real: attach + daemon (backends $TGT1, $TGT2, ttl ${TTL}s)"
 "$BIN" attach "$VH" --pin-dir "$PINS" --ttl-sec "$TTL"
 
 cat >"$SCRATCH/daemon.toml" <<EOF
@@ -161,11 +186,11 @@ interval_secs = 2
 timeout_ms = 3000
 
 [[server]]
-ip = "$IP_H"
+ip = "$IP1"
 port = $PORT1
 
 [[server]]
-ip = "$IP_H"
+ip = "$IP2"
 port = $PORT2
 EOF
 
@@ -199,15 +224,15 @@ DAEMON_PID=""
 echo "real: cached queries from the netns (through the BPF)"
 snap_stats "$SCRATCH/s1"
 check_client "INFO :$PORT1 served from cache, name matches" \
-	info "$IP_H:$PORT1" --expect-name "$NAME1" --hex-out "$SCRATCH/cache1.info"
+	info "$TGT1" --expect-name "$NAME1" --hex-out "$SCRATCH/cache1.info"
 check_client "PLAYERS :$PORT1 served from cache" \
-	players "$IP_H:$PORT1" --hex-out "$SCRATCH/cache1.players"
+	players "$TGT1" --hex-out "$SCRATCH/cache1.players"
 check_client "INFO :$PORT2 served from cache, name matches (isolation)" \
-	info "$IP_H:$PORT2" --expect-name "$NAME2" --hex-out "$SCRATCH/cache2.info"
+	info "$TGT2" --expect-name "$NAME2" --hex-out "$SCRATCH/cache2.info"
 check_client "PLAYERS :$PORT2 served from cache" \
-	players "$IP_H:$PORT2" --hex-out "$SCRATCH/cache2.players"
+	players "$TGT2" --hex-out "$SCRATCH/cache2.players"
 check_client "repeat INFO :$PORT1 still cached (idempotent)" \
-	info "$IP_H:$PORT1" --expect-name "$NAME1"
+	info "$TGT1" --expect-name "$NAME1"
 snap_stats "$SCRATCH/s2"
 
 d_si=$(delta "$SCRATCH/s1" "$SCRATCH/s2" served_info)
@@ -231,7 +256,7 @@ echo "real: stale entry -> pass-through to the real server"
 sleep $((TTL + 2))
 snap_stats "$SCRATCH/s3"
 check_client "stale INFO :$PORT1 passed through to the real server" \
-	info "$IP_H:$PORT1" --expect-name "$NAME1" --timeout 10
+	info "$TGT1" --expect-name "$NAME1" --timeout 10
 snap_stats "$SCRATCH/s4"
 # A2S INFO dance = two request datagrams (unchallenged + challenged).
 check "both request datagrams passed through" \
@@ -239,9 +264,9 @@ check "both request datagrams passed through" \
 
 echo "real: tracker/browser path unaffected (direct queries after test)"
 check "server 1 still answers direct queries" \
-	python3 "$SCRIPT_DIR/client.py" info "$IP_H:$PORT1" --expect-name "$NAME1"
+	python3 "$SCRIPT_DIR/client.py" info "$TGT1" --expect-name "$NAME1"
 check "server 2 still answers direct queries" \
-	python3 "$SCRIPT_DIR/client.py" info "$IP_H:$PORT2" --expect-name "$NAME2"
+	python3 "$SCRIPT_DIR/client.py" info "$TGT2" --expect-name "$NAME2"
 
 echo "real: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

@@ -9,11 +9,12 @@
 #![no_main]
 
 use a2s_protocol::{
-    cache_key, stats, CacheEntry, Config, RateEntry, CHALLENGE_RESP_LEN, INFO_BODY, INFO_REQ_LEN,
+    CACHE_MAX_ENTRIES, CHALLENGE_RESP_LEN, CacheEntry, Config, INFO_BODY, INFO_REQ_LEN,
     INFO_REQ_LEN_CHALLENGED, MAGIC, MAX_PAYLOAD, NO_CHALLENGE, PLAYER_REQ_LEN, REDIRECT_MODE_XMIT,
-    TYPE_CHALLENGE, TYPE_INFO_REQ, TYPE_PLAYER_REQ,
+    RateEntry, TYPE_CHALLENGE, TYPE_INFO_REQ, TYPE_PLAYER_REQ, cache_key, stats,
 };
 use aya_ebpf::{
+    EbpfContext,
     bindings::{__be32, __sk_buff},
     helpers::{
         bpf_csum_diff, bpf_get_prandom_u32, bpf_ktime_get_ns, bpf_redirect, bpf_redirect_peer,
@@ -22,7 +23,6 @@ use aya_ebpf::{
     macros::{classifier, map},
     maps::{Array, HashMap, PerCpuArray},
     programs::TcContext,
-    EbpfContext,
 };
 
 const TC_ACT_OK: i32 = 0;
@@ -48,7 +48,8 @@ const NS_PER_SEC: u64 = 1_000_000_000;
 static CONFIG_MAP: Array<Config> = Array::<Config>::with_max_entries(1, 0);
 
 #[map]
-static CACHE_MAP: HashMap<u64, CacheEntry> = HashMap::<u64, CacheEntry>::with_max_entries(64, 0);
+static CACHE_MAP: HashMap<u64, CacheEntry> =
+    HashMap::<u64, CacheEntry>::with_max_entries(CACHE_MAX_ENTRIES, 0);
 
 #[map]
 static RATE_IP_MAP: HashMap<u32, RateEntry> = HashMap::<u32, RateEntry>::with_max_entries(65536, 0);
@@ -192,7 +193,14 @@ fn a2scache_ingress(ctx: TcContext) -> i32 {
     };
 
     let now = unsafe { bpf_ktime_get_ns() };
-    let ttl = cfg.ttl_ns;
+    // Per-instance freshness window: entries carry the `[[server]]` override
+    // written by the daemon (the `[defaults]` fallback lives here so an entry
+    // that was never refreshed — ttl_ns == 0 — still uses the global TTL).
+    let ttl = if entry.ttl_ns != 0 {
+        entry.ttl_ns
+    } else {
+        cfg.ttl_ns
+    };
     let fresh = |ts: u64| ts != 0 && now.saturating_sub(ts) < ttl;
 
     // A no-challenge or 0xFFFFFFFF request asks for the challenge, for both
@@ -387,10 +395,12 @@ fn serve_response(
     let payload_len = args.payload_len;
     // The `> MAX_PAYLOAD` half of this guard is a compile-time constant,
     // which the verifier can use to bound the map-value accesses below
-    // (payloads live in 2048-byte regions inside the 4144-byte entry);
-    // `cfg.max_payload` alone is a runtime value it cannot prove against.
-    // The `== 0` half proves a non-zero copy size: callers never serve an
-    // empty body, and `bpf_skb_store_bytes` rejects ranges that include 0.
+    // (payloads live in 2048-byte regions inside the 4152-byte entry; the
+    // trailing per-instance `ttl_ns` is read at a constant offset, in
+    // bounds); `cfg.max_payload` alone is a runtime value it cannot prove
+    // against. The `== 0` half proves a non-zero copy size: callers never
+    // serve an empty body, and `bpf_skb_store_bytes` rejects ranges that
+    // include 0.
     if cfg.ifindex_out == 0
         || payload_len == 0
         || payload_len > cfg.max_payload
@@ -484,7 +494,8 @@ fn serve_response(
     // <= MAX_PAYLOAD for any `payload_len` <= MAX_PAYLOAD), but it pins the
     // verifier's upper bound at 2048: without it the tracked range tops out
     // at 2051, which pushes the player payload (entry offset 2096) past the
-    // end of the 4144-byte map value.
+    // end of the 4152-byte map value (it would have to fit in the 4144-byte
+    // pre-ttl_ns layout).
     let csum_len = ((payload_len + 3) & !3u32).min(MAX_PAYLOAD as u32);
     // UDP pseudo-header: response src ip (server), response dst ip (client),
     // zero, proto, udp length.

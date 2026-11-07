@@ -11,21 +11,37 @@ pin_dir = "/sys/fs/bpf/a2scache"
 [defaults]
 # How long the BPF program serves an entry before passing through (seconds).
 # `attach --ttl-sec` sets an initial value; serve overwrites it with this.
+# Instances may override this per [[server]] entry (ttl_secs).
 ttl_secs = 30
 # Time between refresh cycles per backend (seconds). Keep well below ttl_secs.
+# Instances may override this per [[server]] entry (interval_secs).
 interval_secs = 10
 # Per-datagram receive timeout for the challenge dance (milliseconds, >= 100).
+# Instances may override this per [[server]] entry (timeout_ms).
 timeout_ms = 2000
 # Token-bucket rate limits, in milli-tokens (see `a2scache status`).
+# These limit CLIENT query rate (per-source-IP + one global bucket); they are
+# not per-instance.
 per_ip_capacity = 10000
 per_ip_refill_per_s = 2000
 global_capacity = 200000
 global_refill_per_s = 50000
 
-# One entry per backend. The BPF cache key is (ip, port), so two servers on
-# the same host need one entry per port. `mac` is optional: when set, the
-# first server's MAC becomes the source MAC of synthesized replies
-# (otherwise the MAC recorded by `attach` is kept).
+# One entry per game instance. The BPF cache key is (ip, port): two servers
+# on the same host need one entry per port, and duplicates of the same
+# (ip, port) are rejected. The cache map holds at most
+# a2s_protocol::CACHE_MAX_ENTRIES (4096) instances; the daemon refuses a
+# config with more.
+#
+# Every per-instance field is optional and falls back to [defaults]:
+#
+#   mac          source MAC of synthesized replies. Optional: when set, the
+#                first server's MAC becomes the global source MAC of
+#                synthesized replies (otherwise the MAC recorded by `attach`
+#                is kept; BPF holds a single global MAC).
+#   ttl_secs     per-instance freshness window override.
+#   interval_secs per-instance refresh cadence override.
+#   timeout_ms   per-instance receive timeout override.
 #
 # IMPORTANT: use the address you want CLIENTS to see (the IP the BPF
 # program answers for), and make sure the daemon can reach the server at
@@ -37,7 +53,13 @@ global_refill_per_s = 50000
 ip = "192.0.2.10"
 port = 27015
 # mac = "aa:bb:cc:dd:ee:ff"
+# ttl_secs = 60
+# interval_secs = 5
+# timeout_ms = 1500
 
+# A low-population instance: refreshed less often, kept warm longer.
 [[server]]
 ip = "192.0.2.10"
 port = 27025
+ttl_secs = 90
+interval_secs = 30

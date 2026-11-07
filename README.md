@@ -157,23 +157,41 @@ global_refill_per_s = 50000
 ip = "192.0.2.10"      # the (ip, port) clients query — the BPF cache key
 port = 27015
 # mac = "aa:bb:cc:dd:ee:ff"   # optional source MAC for synthesized replies
+# ttl_secs = 60               # per-instance TTL override (falls back to defaults)
+# interval_secs = 5           # per-instance refresh period override
+# timeout_ms = 1500           # per-instance dance timeout override
 ```
 
 Notes:
 
 - **One `[[server]]` per `(ip, port)`**; two servers on one host need one
-entry per port.
+  entry per port, and duplicate `(ip, port)` entries are rejected. The
+  cache map holds at most **4096 instances**
+  (`a2s_protocol::CACHE_MAX_ENTRIES`, a compile-time BPF map parameter —
+  the daemon refuses a config with more).
+- Every per-instance `[[server]]` field is optional and falls back to
+  `[defaults]` (enforcing the same validity floors: `ttl_secs >= 1`,
+  `interval_secs >= 1`, `timeout_ms >= 100`), so instances can be tuned
+  independently — e.g. an often-visited instance gets a longer TTL and a
+  faster refresh than a sleepy one. The BPF program reads the TTL
+  *per instance* (stored in the cache entry; until an entry's first
+  successful refresh, the global TTL applies).
+- The client-facing rate limiter (per source IP + one global bucket) is
+  *not* per-instance: it bounds what a client/tracker can send, not how a
+  given instance behaves. Per-instance "rate" tuning is the refresh
+  `interval_secs`.
 - `ip` is the address clients use (and therefore the address the daemon
-queries). For a server on the same machine as the cache, use the
-machine's real IP, **not** `127.0.0.1` (Source ignores A2S from
-`127/8`).
+  queries). For a server on the same machine as the cache, use the
+  machine's real IP, **not** `127.0.0.1` (Source ignores A2S from
+  `127/8`).
 - A wildcard-bound (`0.0.0.0`) server sources its *pass-through* replies
-with the egress interface's address. If pass-through replies must
-complete the dance (stale/unknown entries), pick `ip` on the interface
-the reply will leave by.
+  with the egress interface's address. If pass-through replies must
+  complete the dance (stale/unknown entries), pick `ip` on the interface
+  the reply will leave by.
 - `mac`: when set, the first server's MAC becomes the source MAC of all
-synthesized replies; otherwise the MAC recorded at `attach` time is
-used.
+  synthesized replies; otherwise the MAC recorded at `attach` time is
+  used. (BPF holds a single global MAC; per-instance MACs for backends on
+  other hosts are not supported yet.)
 
 ## Rate limiting
 
@@ -210,6 +228,20 @@ refill; for a small LAN leave the defaults.
 | `non_a2s`                                                                                 | non-Ethernet/IPv4/UDP or IP-fragmented frames (passed) |
 | `unknown_key`                                                                             | A2S for a `(dip, dport)` that is not cached (passed)   |
 
+
+## Status
+
+`a2scache status` renders the config and every cache entry: a count /
+capacity header (instances cached vs. the compile-time 4096 limit), each
+instance's payload sizes/ages, challenge, effective per-instance TTL, and
+the server name parsed from the cached INFO payload.
+
+`a2scache status --json` emits the same list machine-readable (unset
+payload ages are `null`):
+
+```json
+{"capacity": 4096, "entries": [{"ip": "1.2.3.4", "port": 27015, "name": "Uncletopia | Example", "challenge": 12345, "challenge_age_s": 2, "info_len": 140, "info_age_s": 1, "player_len": 90, "player_age_s": 1, "ttl_s": 30}], "count": 1}
+```
 
 ## Kernel compatibility
 
@@ -266,14 +298,19 @@ bpffs.
 
 - `just test` — unit tests (protocol codec, reassembly, map layouts,
 daemon refresh logic, BPF ELF sanity).
-- `just test-e2e` — root: builds a veth/netns topology, runs two fake
-TF2 backends (challenge-first dance, FE fragmentation, per-backend
-query counters), attaches the program, and checks: cache serving,
+- `just test-e2e` — root: builds a veth/netns topology, runs fake TF2
+backends (challenge-first dance, FE fragmentation, per-backend query
+counters), attaches the program, and checks: cache serving,
 per-`(ip, port)` isolation, fragmented responses, stale → pass-through,
-backend-A-down with B unaffected, rate-limit bursts.
+backend-A-down with B unaffected, rate-limit bursts, per-instance TTL
+divergence (a short-TTL instance goes stale while a long-TTL one stays
+fresh), and an 8-instance scale scenario (all cached, isolated, and
+served from cache; `status` / `status --json` machine-checked).
 - `just test-e2e-real` — root + live srcds: same harness against two real
 TF2 dedicated servers; cached replies must be byte-identical to direct
-queries.
+queries. Takes optional `ADDR1 ADDR2` (bare port = the harness veth IP, or
+an explicit `ip:port` for a backend bound to another of the host's
+addresses).
 
 ## Troubleshooting
 

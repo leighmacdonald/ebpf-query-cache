@@ -3,13 +3,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use a2s_protocol::{
-    cache_key_unpack, stats, CacheEntry, Config, MAX_PAYLOAD, REDIRECT_MODE_PEER,
-    REDIRECT_MODE_XMIT,
+    CACHE_MAX_ENTRIES, CacheEntry, Config, MAX_PAYLOAD, REDIRECT_MODE_PEER, REDIRECT_MODE_XMIT,
+    cache_key_unpack, info_banner_name, stats,
 };
+use aya::EbpfLoader;
 use aya::maps::{Array, HashMap, Map, MapData, PerCpuArray};
 use aya::programs::tc;
 use aya::programs::{SchedClassifier, TcAttachType};
-use aya::EbpfLoader;
 
 use crate::{Error, Result};
 
@@ -218,7 +218,8 @@ pub fn attach(elf: &[u8], iface: &str, pin_dir: &Path, ttl_sec: u64) -> Result<(
 
     println!(
         "attached {PROG_NAME} on {iface} (ingress); pins in {pin_dir:?}; \
-         ttl {ttl_sec}s, max_payload {MAX_PAYLOAD} B, redirect_mode={}",
+         ttl {ttl_sec}s, cache capacity {CACHE_MAX_ENTRIES} instances, \
+         max_payload {MAX_PAYLOAD} B, redirect_mode={}",
         redirect_mode_name(cfg.redirect_mode)
     );
     println!("run `a2scache serve --config <file>` to populate the cache");
@@ -256,7 +257,52 @@ pub fn clean(iface: &str, pin_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn status(pin_dir: &Path) -> Result<()> {
+fn truncate_40(s: &str) -> String {
+    s.chars().take(40).collect()
+}
+
+/// JSON string literal with escaping for `\`, `"` and control characters
+/// (server names come from arbitrary TF2 backends, so no charset is assumed).
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// One rendered `CACHE_MAP` entry for `status`. Ages are seconds since the
+/// last refresh; `None` means the half has never been populated.
+#[derive(Clone, Debug)]
+struct StatusEntry {
+    ip: u32,
+    port: u16,
+    /// A2S server name parsed from the cached INFO payload.
+    name: Option<String>,
+    challenge: u32,
+    ch_age: Option<u64>,
+    info_len: u16,
+    info_age: Option<u64>,
+    player_len: u16,
+    player_age: Option<u64>,
+    /// Effective per-instance TTL (ns/1e9) recorded inside the entry; 0
+    /// means the entry has never been refreshed (global TTL applies).
+    ttl_secs: u64,
+}
+
+pub fn status(pin_dir: &Path, json: bool) -> Result<()> {
     let data = MapData::from_pin(pin_path(pin_dir, MAP_CONFIG)).map_err(|e| {
         Error::Bad(format!(
             "cannot open {}: {e} (is the program attached? run `a2scache attach <iface>`)",
@@ -266,68 +312,144 @@ pub fn status(pin_dir: &Path) -> Result<()> {
     let config: Array<MapData, Config> = Map::from_map_data(data)?.try_into()?;
     let zero = 0u32;
     let cfg = config.get(&zero, 0)?;
-    println!("config:");
-    println!("  enabled       : {}", cfg.enabled);
-    println!("  ifindex_out   : {}", cfg.ifindex_out);
-    println!(
-        "  redirect_mode : {}",
-        redirect_mode_name(cfg.redirect_mode)
-    );
-    println!("  ttl           : {} s", cfg.ttl_ns / 1_000_000_000);
-    println!("  max_payload   : {}", cfg.max_payload);
-    println!(
-        "  rate per_ip : cap {} milli-tok, refill {}/s",
-        cfg.per_ip_capacity, cfg.per_ip_refill_per_s
-    );
-    println!(
-        "  rate global : cap {} milli-tok, refill {}/s",
-        cfg.global_capacity, cfg.global_refill_per_s
-    );
-    println!(
-        "  backend_mac   : {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        cfg.backend_mac[0],
-        cfg.backend_mac[1],
-        cfg.backend_mac[2],
-        cfg.backend_mac[3],
-        cfg.backend_mac[4],
-        cfg.backend_mac[5]
-    );
 
     let data = MapData::from_pin(pin_path(pin_dir, MAP_CACHE))?;
     let cache: HashMap<MapData, u64, CacheEntry> = Map::from_map_data(data)?.try_into()?;
     let now = now_ns()?;
 
-    println!("cache entries:");
-    let mut n = 0usize;
+    let mut entries = Vec::<StatusEntry>::new();
     for kv in cache.iter() {
         let (key, e) = kv?;
         let (ip, port) = cache_key_unpack(key);
-        let o = ip.to_be_bytes();
         let age = |ts: u64| {
             if ts == 0 {
-                "-".to_string()
+                None
             } else {
-                (now.saturating_sub(ts) / 1_000_000_000).to_string()
+                Some(now.saturating_sub(ts) / 1_000_000_000)
             }
         };
-        println!(
-            "  {}.{}.{}.{}:{}  ch={} ch_age={}s info_len={} info_age={}s player_len={} player_age={}s",
-            o[0],
-            o[1],
-            o[2],
-            o[3],
+        let name = info_banner_name(&e.info[..e.info_len as usize]).map(|s| s.to_owned());
+        entries.push(StatusEntry {
+            ip,
             port,
-            e.challenge,
-            age(e.ts_challenge),
-            e.info_len,
-            age(e.ts_info),
-            e.player_len,
-            age(e.ts_player)
-        );
-        n += 1;
+            name,
+            challenge: e.challenge,
+            ch_age: age(e.ts_challenge),
+            info_len: e.info_len,
+            info_age: age(e.ts_info),
+            player_len: e.player_len,
+            player_age: age(e.ts_player),
+            ttl_secs: e.ttl_ns / 1_000_000_000,
+        });
     }
-    if n == 0 {
-        println!("  (empty)");
+    // Stable report order regardless of hash-table iteration.
+    entries.sort_by_key(|e| u64::from(e.ip) << 16 | u64::from(e.port));
+
+    if json {
+        let o = |v: Option<u64>| match v {
+            Some(v) => v.to_string(),
+            None => "null".to_string(),
+        };
+        let items = entries
+            .iter()
+            .map(|e| {
+                let oct = e.ip.to_be_bytes();
+                format!(
+                    "    {{\"ip\": \"{}.{}.{}.{}\", \"port\": {}, \"name\": {}, \
+                     \"challenge\": {}, \"challenge_age_s\": {}, \
+                     \"info_len\": {}, \"info_age_s\": {}, \
+                     \"player_len\": {}, \"player_age_s\": {}, \"ttl_s\": {}}}",
+                    oct[0],
+                    oct[1],
+                    oct[2],
+                    oct[3],
+                    e.port,
+                    match &e.name {
+                        Some(n) => json_str(n),
+                        None => "null".to_string(),
+                    },
+                    e.challenge,
+                    o(e.ch_age),
+                    e.info_len,
+                    o(e.info_age),
+                    e.player_len,
+                    o(e.player_age),
+                    e.ttl_secs
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",\n");
+        println!("{{\"capacity\": {CACHE_MAX_ENTRIES}, \"entries\": [");
+        if !items.is_empty() {
+            println!("{items}");
+        }
+        println!("], \"count\": {}}}", entries.len());
+    } else {
+        println!("config:");
+        println!("  enabled       : {}", cfg.enabled);
+        println!("  ifindex_out   : {}", cfg.ifindex_out);
+        println!(
+            "  redirect_mode : {}",
+            redirect_mode_name(cfg.redirect_mode)
+        );
+        println!(
+            "  ttl           : {} s (instances may override per entry)",
+            cfg.ttl_ns / 1_000_000_000
+        );
+        println!("  max_payload   : {}", cfg.max_payload);
+        println!(
+            "  rate per_ip : cap {} milli-tok, refill {}/s",
+            cfg.per_ip_capacity, cfg.per_ip_refill_per_s
+        );
+        println!(
+            "  rate global : cap {} milli-tok, refill {}/s",
+            cfg.global_capacity, cfg.global_refill_per_s
+        );
+        println!(
+            "  backend_mac   : {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            cfg.backend_mac[0],
+            cfg.backend_mac[1],
+            cfg.backend_mac[2],
+            cfg.backend_mac[3],
+            cfg.backend_mac[4],
+            cfg.backend_mac[5]
+        );
+
+        println!(
+            "cache entries: {} / {CACHE_MAX_ENTRIES} ({:.1}% full)",
+            entries.len(),
+            100.0 * entries.len() as f64 / f64::from(CACHE_MAX_ENTRIES)
+        );
+        for e in &entries {
+            let oct = e.ip.to_be_bytes();
+            let age = |v: Option<u64>| match v {
+                Some(v) => format!("{v}s"),
+                None => "-".to_string(),
+            };
+            let name = match &e.name {
+                Some(n) => truncate_40(n),
+                None => "-".to_string(),
+            };
+            println!(
+                "  {}.{}.{}.{}:{}  info_len={} info_age={} player_len={} player_age={} \
+                 ch={} ch_age={} ttl={}s name={name}",
+                oct[0],
+                oct[1],
+                oct[2],
+                oct[3],
+                e.port,
+                e.info_len,
+                age(e.info_age),
+                e.player_len,
+                age(e.player_age),
+                e.challenge,
+                age(e.ch_age),
+                e.ttl_secs
+            );
+        }
+        if entries.is_empty() {
+            println!("  (empty)");
+        }
     }
     Ok(())
 }

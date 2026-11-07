@@ -178,7 +178,7 @@ fn merge_zeroes_tails() {
         info: Some(info_response()),
         player: None, // failed half keeps the old bytes
     };
-    let e = daemon::merge_entry(&old, &data, 12345);
+    let e = daemon::merge_entry(&old, &data, 12345, 30_000_000_000u64);
     assert_eq!(e.challenge, 7);
     assert_eq!(e.ts_challenge, 12345);
     assert_eq!(e.info_len as usize, info_response().len());
@@ -192,6 +192,9 @@ fn merge_zeroes_tails() {
     assert_eq!(e.player_len, MAX_PAYLOAD as u16);
     assert_eq!(e.player, [0xBB; MAX_PAYLOAD]);
     assert_eq!(e.ts_player, 0);
+    // Per-instance TTL lands in the entry (BPF reads it, falling back to
+    // the global TTL only while ttl_ns == 0).
+    assert_eq!(e.ttl_ns, 30_000_000_000u64);
 }
 
 #[test]
