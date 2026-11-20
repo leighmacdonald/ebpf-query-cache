@@ -316,6 +316,19 @@ Note: because the BPF stats map is re-created on every `attach`, the
 after a re-attach; the exporter resets the Prometheus counter at that
 point (Prometheus itself handles counter resets for `rate()`/`increase()`).
 
+### Grafana dashboard
+
+Import [`examples/a2scache-grafana.json`](examples/a2scache-grafana.json)
+via **Dashboards → New → Import** (Grafana 10/11; needs a Prometheus
+datasource). Variables at the top select the datasource, scrape `job` and
+daemon `instance`. The overview aggregates across all selected daemons
+(one value per panel rather than one tile per server), with a compact
+**Per-daemon status** table giving one row per server. Other panels cover
+query verdicts and cache hit rate, drops and rewrite failures, cache
+entries/ages/TTL, and backend refresh health. Counter panels use
+`rate()`/`increase()`, so re-attaches are handled, and the dashboard
+refreshes every 30 s to match the per-scrape metric refresh.
+
 ## Kernel compatibility
 
 - **Minimum kernel 5.7**, set by `bpf_redirect_peer`. Other helpers are

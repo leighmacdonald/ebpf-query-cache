@@ -1,6 +1,6 @@
 # Example a2scache refresh-daemon config.
 #
-# Install to /etc/a2scache.toml (`just install` does this), edit the
+# Install to /etc/a2scache.toml, edit the
 # [[server]] entries to point at your TF2 backends, then:
 #   a2scache attach <iface> && a2scache serve --config /etc/a2scache.toml
 
@@ -64,9 +64,3 @@ port = 27015
 # interval_secs = 5
 # timeout_ms = 1500
 
-# A low-population instance: refreshed less often, kept warm longer.
-[[server]]
-ip = "192.0.2.10"
-port = 27025
-ttl_secs = 90
-interval_secs = 30
