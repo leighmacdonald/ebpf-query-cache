@@ -64,3 +64,10 @@ port = 27015
 # interval_secs = 5
 # timeout_ms = 1500
 
+# A low-population instance: refreshed less often, kept warm longer.
+[[server]]
+ip = "192.0.2.10"
+port = 27025
+ttl_secs = 90
+interval_secs = 30
+
